@@ -1,4 +1,4 @@
-# Filename: hedging_strategies.py
+# hedging_strategies.py
 
 import streamlit as st
 import pandas as pd
@@ -9,6 +9,7 @@ import matplotlib.dates as mdates
 from matplotlib.ticker import PercentFormatter
 
 # We'll import your main functions from the existing app (assuming the same folder structure)
+# Make sure these functions are present in your local 'streamlit_app.py'
 from streamlit_app import (
     load_and_preprocess_data,   # Loads allocations + quarterly asset returns
     load_individual_endowments, # Loads individual_endowments.csv
@@ -16,7 +17,6 @@ from streamlit_app import (
     map_allocations_to_periods,
     calculate_cumulative_and_dd
 )
-
 
 ###############################################################################
 #                  LOAD HEDGING STRATEGIES CSV
@@ -32,13 +32,14 @@ def load_hedging_strategies():
       'Med'    -> 'Time Series Momentum (Med)'
       'Slow'   -> 'Time Series Momentum (Slow)'
       'V Slow' -> 'Time Series Momentum (Very Slow)'
-    so that all five speeds are recognized as TSM strategies.
+    Then resample to quarterly in the main app, so everything is on a quarterly frequency.
     """
     file_path = "data/hedging_strategies.csv"
     df = pd.read_csv(file_path, sep=';', header=0)
     df['Date'] = pd.to_datetime(df['Date'], format='%d.%m.%Y', errors='coerce')
     df.set_index('Date', inplace=True)
-    # Move index to end of month
+
+    # Move index to end of the month
     df.index = df.index + pd.offsets.MonthEnd(0)
 
     for col in df.columns:
@@ -60,17 +61,17 @@ def load_hedging_strategies():
 
     return df
 
-
 ###############################################################################
-#               CRISIS DETECTION (REP ENDOWMENT)
+#               CRISIS DETECTION (SYNTHETIC ENDOWMENT)
 ###############################################################################
 def find_crisis_periods_for_rep_endowment(dd_series, threshold=0.05):
     """
-    Identify crisis periods in the Representative Endowment's drawdown if ≥ threshold (5%).
-    For each crisis, the "Peak Date" is defined as the last date before the drawdown begins (when the drawdown was zero or positive),
-    and the "Trough Date" is when the maximum drawdown is reached.
+    Identify crisis periods in the Synthetic Endowment Index's drawdown if ≥ threshold (5%).
+    For each crisis, the 'Start' is the last date before the drawdown begins (when the drawdown
+    was zero or positive), and the 'Trough' is when the maximum drawdown is reached. The 'End'
+    date is when the drawdown fully recovers back to 0%. Returns a list of dicts:
+       { 'Start', 'Trough', 'End', 'Max Drawdown' }.
     Crises where the peak and trough dates are the same are skipped.
-    Returns a list of dicts: { 'Start', 'Trough', 'End', 'Max Drawdown' }.
     """
     ds = dd_series.copy()
     in_crisis = False
@@ -96,7 +97,7 @@ def find_crisis_periods_for_rep_endowment(dd_series, threshold=0.05):
             if dd_val == 0:
                 in_crisis = False
                 end_date = date
-                # Only add the crisis if the peak and trough are distinct.
+                # Only add the crisis if the peak and trough are distinct and dd ≤ -threshold
                 if max_dd <= -threshold and start_date != trough_date:
                     crises.append({
                         'Start': start_date,
@@ -117,54 +118,45 @@ def find_crisis_periods_for_rep_endowment(dd_series, threshold=0.05):
             })
     return crises
 
-
-
 ###############################################################################
-#     PIVOT TABLE (ORIGINAL): SHOW HEDGING STRATEGIES' CUMULATIVE PERF
+#     PIVOT TABLE (REVISED): SHOW HEDGING STRATEGIES' PEAK->TROUGH PERF
 ###############################################################################
 def pivot_crises_quarterly(rep_crises, cum_dict):
     """
-    Build a table for each crisis (≥5% on Representative Endowment).
-    Columns: Crisis1, Crisis2, ...
-    Rows:
-      1) Beginning Date
-      2) Trough Date
-      3) Rep. Endowment Max Drawdown
-      4) Drawdown Length (quarters)
-      5) Time to Recovery (quarters)
-      6) midrule1
-      7) Public Equity Drawdown
-      8) Public Equity Time to Recovery
-      9) midrule2
-      Then each hedging strategy => single row with the cumulative performance
-      from crisis Start to crisis End.
+    Build a table for each crisis (≥5% on Synthetic Endowment Index).
+
+    Revised to:
+      • Report hedging performance from Start (peak) -> Trough only
+      • Include a new "Recovery Date" row
+      • Keep time-to-recovery logic for the Synthetic Endowment Index
+        (peak -> trough -> full recovery).
     """
     if not rep_crises:
         return pd.DataFrame()
 
     col_names = [f"Crisis{i+1}" for i in range(len(rep_crises))]
 
+    # We add a "Recovery Date" row after Trough Date:
     row_labels = [
-        "Beginning Date",
+        "Beginning Date",   # crisis start
         "Trough Date",
-        "Rep. Endowment Max Drawdown",
+        "Recovery Date",    # new row
+        "Synthetic Endowment Index Max Drawdown",
         "Drawdown Length (quarters)",
         "Time to Recovery (quarters)",
         "midrule1",
-        "Public Equity Drawdown",
+        "Public Equity Drawdown (Peak->Trough)",
         "Public Equity Time to Recovery",
         "midrule2"
     ]
 
-    # Identify hedging columns except "Representative Endowment" and "Public Equity"
-    exclude_labels = ["Representative Endowment", "Public Equity"]
+    # Identify hedging columns except "Synthetic Endowment Index" and "Public Equity"
+    exclude_labels = ["Synthetic Endowment Index", "Public Equity"]
     hedge_strategies = [
         k for k in cum_dict.keys() if k not in exclude_labels and not cum_dict[k].empty
     ]
 
-    row_entries = list(hedge_strategies)  # Each hedge in a separate row
-    final_rows = row_labels + row_entries
-
+    final_rows = row_labels + hedge_strategies
     data = {c: [""] * len(final_rows) for c in col_names}
 
     def approximate_quarters_diff(ts_start, ts_end):
@@ -172,9 +164,15 @@ def pivot_crises_quarterly(rep_crises, cum_dict):
         if days_diff < 0:
             return 0
         months = days_diff / 30.4375
-        return max(1, int(math.ceil(months / 3)))
+        q_float = months / 3.0
+        q_rounded = int(round(q_float))
+        return max(1, q_rounded)
 
     def find_time_to_recovery_q(cum_series, start_d, trough_d):
+        """
+        If we want to see how many quarters from Trough until
+        the series gets back above the Start's value, do that here.
+        """
         if start_d not in cum_series.index or trough_d not in cum_series.index:
             return None
         peak_val = cum_series.loc[start_d]
@@ -184,7 +182,7 @@ def pivot_crises_quarterly(rep_crises, cum_dict):
             return None
         return approximate_quarters_diff(trough_d, rec_idx[0])
 
-    rep_cum = cum_dict.get("Representative Endowment", pd.Series(dtype=float))
+    syn_cum = cum_dict.get("Synthetic Endowment Index", pd.Series(dtype=float))
     pe_cum  = cum_dict.get("Public Equity", pd.Series(dtype=float))
 
     for i, crisis in enumerate(rep_crises):
@@ -194,57 +192,59 @@ def pivot_crises_quarterly(rep_crises, cum_dict):
         e_dt = crisis['End']
         mdd = crisis['Max Drawdown']
 
-        # Rows 0,1,2,3,4 = Basic crisis info
+        # Rows 0..2 => Basic crisis dates
         data[cname][0] = str(s_dt.date())  # Beginning Date
         data[cname][1] = str(t_dt.date())  # Trough Date
-        data[cname][2] = f"{mdd:.1%}"      # Rep. Endowment MaxDD
+        data[cname][2] = str(e_dt.date())  # Recovery Date (new)
+
+        # Row 3..5 => Synthetic Endowment drawdown stats
+        data[cname][3] = f"{mdd:.1%}"  # Max Drawdown
         len_q = approximate_quarters_diff(s_dt, t_dt)
-        data[cname][3] = f"{len_q}"
-        if (s_dt in rep_cum.index) and (t_dt in rep_cum.index):
-            r_ttr = find_time_to_recovery_q(rep_cum, s_dt, t_dt)
-            data[cname][4] = f"{r_ttr}" if r_ttr else "n/a"
+        data[cname][4] = f"{len_q}"
+        if syn_cum is not None and not syn_cum.empty \
+           and (s_dt in syn_cum.index) and (t_dt in syn_cum.index):
+            r_ttr = find_time_to_recovery_q(syn_cum, s_dt, t_dt)
+            data[cname][5] = f"{r_ttr}" if r_ttr else "n/a"
         else:
-            data[cname][4] = "n/a"
+            data[cname][5] = "n/a"
 
-        # row 5 => midrule1
-        data[cname][5] = "midrule1"
+        # row 6 => midrule1
+        data[cname][6] = "midrule1"
 
-        # rows 6,7 => Public Equity Drawdown + Time to Recovery
+        # row 7..8 => Public Equity stats, peak->trough
         if pe_cum is not None and not pe_cum.empty \
-           and s_dt in pe_cum.index and t_dt in pe_cum.index:
+           and (s_dt in pe_cum.index) and (t_dt in pe_cum.index):
             pe_pk = pe_cum.loc[s_dt]
             pe_th = pe_cum.loc[t_dt]
             eq_dd = (pe_th - pe_pk) / pe_pk
-            data[cname][6] = f"{eq_dd:.1%}" if eq_dd < -1e-9 else "n/a"
+            data[cname][7] = f"{eq_dd:.1%}" if eq_dd < -1e-9 else "n/a"
 
             eq_ttr = find_time_to_recovery_q(pe_cum, s_dt, t_dt)
-            data[cname][7] = f"{eq_ttr}" if eq_ttr else "n/a"
+            data[cname][8] = f"{eq_ttr}" if eq_ttr else "n/a"
         else:
-            data[cname][6] = "n/a"
             data[cname][7] = "n/a"
+            data[cname][8] = "n/a"
 
-        # row 8 => midrule2
-        data[cname][8] = "midrule2"
+        # row 9 => midrule2
+        data[cname][9] = "midrule2"
 
-        # Hedge strategies
-        offset = len(row_labels)  # first row index for hedges
+        # Hedge strategies => measure from Start->Trough
+        offset = len(row_labels)
         for idx_h, strat_name in enumerate(hedge_strategies):
             row_idx = offset + idx_h
             strat_cum = cum_dict[strat_name]
-            # measure cumulative performance from start to end
-            if s_dt in strat_cum.index and e_dt in strat_cum.index:
+            if s_dt in strat_cum.index and t_dt in strat_cum.index:
                 start_val = strat_cum.loc[s_dt]
-                end_val   = strat_cum.loc[e_dt]
+                trough_val = strat_cum.loc[t_dt]
                 if start_val <= 1e-9:
                     data[cname][row_idx] = "n/a"
                 else:
-                    perf = (end_val / start_val) - 1.0
+                    perf = (trough_val / start_val) - 1.0
                     data[cname][row_idx] = f"{perf:.1%}"
             else:
                 data[cname][row_idx] = "n/a"
 
     return pd.DataFrame(data, index=final_rows)
-
 
 def export_table_to_latex_pivot(df, description="Quarterly Crisis Table + Hedge Perf"):
     """
@@ -262,9 +262,9 @@ def export_table_to_latex_pivot(df, description="Quarterly Crisis Table + Hedge 
     lines.append(r"\begin{tiny}")
     lines.append(
         rf"\caption{{\normalsize{{{description}}}\\"  
-        r"\footnotesize{Crises identified at 5\% threshold on Representative Endowment. "
-        r"Public Equity lines are divided by midrules. Hedging strategies show cumulative "
-        r"performance from crisis start to end.}}"
+        r"\footnotesize{Crises identified at 5\% threshold on the Synthetic Endowment Index. "
+        r"Public Equity lines are divided by midrules. Hedging strategies show peak-to-trough "
+        r"performance.}}"
     )
     lines.append(r"\label{table:hedge_crisis}")
     lines.append(r"\begin{tabular*}{\linewidth}{@{\extracolsep{\fill}}" + align_str + r"}")
@@ -276,7 +276,6 @@ def export_table_to_latex_pivot(df, description="Quarterly Crisis Table + Hedge 
     lines.append(r"\midrule")
 
     for row_lbl in row_labels:
-        # If we see 'midrule1' or 'midrule2', we do a midrule and skip that row label
         if row_lbl == "midrule1" or row_lbl == "midrule2":
             lines.append(r"\midrule")
             continue
@@ -296,45 +295,46 @@ def export_table_to_latex_pivot(df, description="Quarterly Crisis Table + Hedge 
     lines.append(r"\end{table}")
     return "\n".join(lines)
 
-
 ###############################################################################
-#    NEW: PIVOT TABLE WITH 90/10 OVERLAY ROWS FOR EACH HEDGING STRATEGY
+#    NEW: PIVOT TABLE WITH 90/10 OVERLAY ROWS, PEAK->TROUGH
 ###############################################################################
 def pivot_crises_quarterly_expanded(rep_crises, cum_dict):
     """
     Build a pivot table for quarterly crises structured in three blocks:
-      Block 1: Representative Endowment drawdown characteristics.
-      Block 2: Hedge Strategy (Peak-to-Trough Returns).
-      Block 3: Rep. Endowment + 10% Overlay Performance.
-    For blocks 2 and 3, the performance is computed only over the peak-to-trough period 
-    (from the crisis 'Start' to the 'Trough').
+      Block 1: Synthetic Endowment Index drawdowns (Peak->Trough->Recovery row).
+      Block 2: Hedge Strategy (peak-to-trough).
+      Block 3: Synthetic Endowment + 10% Overlay (peak-to-trough).
+
+    The difference from the original version:
+      • We measure strategy performance Start->Trough (not Start->End).
+      • We add a "Recovery Date" row but do not use it for the returns.
     """
     if not rep_crises:
         return pd.DataFrame()
 
     col_names = [f"Crisis{i+1}" for i in range(len(rep_crises))]
 
-    # Block 1: Representative Endowment drawdowns
+    # Block 1 row labels (add "Recovery Date" after Trough Date).
     base_rows = [
         "Peak Date",
         "Trough Date",
+        "Recovery Date",
         "Max Drawdown",
         "Drawdown Length (Qtrs)",
         "Time to Recovery (Qtrs)",
-        "midrule1"  # Marker for block divider
+        "midrule1"  # marker
     ]
 
-    # Identify hedging columns (exclude Representative Endowment and Public Equity)
-    exclude_labels = ["Representative Endowment", "Public Equity"]
+    # Identify hedge columns
+    exclude_labels = ["Synthetic Endowment Index", "Public Equity"]
     hedge_strategies = [
         k for k in cum_dict.keys() if k not in exclude_labels and not cum_dict[k].empty
     ]
 
-    # Block 2: Hedge Strategy performance (one row per hedge strategy)
+    # Block 2: Hedge Strategy performance
     block2_rows = hedge_strategies
-
-    # Block 3: 90/10 Overlay performance (one row per hedge strategy)
-    block3_rows = [f"Rep. Endowment + 10\\% {strat}" for strat in hedge_strategies]
+    # Block 3: 90/10 overlay
+    block3_rows = [f"Synthetic Endowment + 10% {strat}" for strat in hedge_strategies]
 
     final_rows = base_rows + block2_rows + ["midrule2"] + block3_rows
     data = {c: [""] * len(final_rows) for c in col_names}
@@ -344,7 +344,9 @@ def pivot_crises_quarterly_expanded(rep_crises, cum_dict):
         if days_diff < 0:
             return 0
         months = days_diff / 30.4375
-        return max(1, int(math.ceil(months / 3)))
+        q_float = months / 3.0
+        q_rounded = int(round(q_float))
+        return max(1, q_rounded)
 
     def find_time_to_recovery_q(cum_series, start_d, trough_d):
         if start_d not in cum_series.index or trough_d not in cum_series.index:
@@ -355,72 +357,79 @@ def pivot_crises_quarterly_expanded(rep_crises, cum_dict):
         if len(rec_idx) == 0:
             return None
         return approximate_quarters_diff(trough_d, rec_idx[0])
-    
-    def compute_overlay_performance(rep_series, hedge_series, s_dt, t_dt, weight=0.1):
+
+    def compute_overlay_performance(syn_series, hedge_series, s_dt, t_dt, weight=0.1):
         """
-        Compute the performance of a portfolio rebalanced quarterly as:
-          90% Representative Endowment + 10% Hedge Strategy.
-        For the subperiod from s_dt (peak) to t_dt (trough), this function computes the quarterly returns
-        for each series, then combines them using the specified weights, and finally recumulated.
+        Compute 90/10 overlay from s_dt to t_dt. If there's only one or two data points
+        per subperiod, this is effectively just a direct ratio or a small chain of returns.
         """
-        if s_dt not in rep_series.index or t_dt not in rep_series.index \
-           or s_dt not in hedge_series.index or t_dt not in hedge_series.index:
+        if (s_dt not in syn_series.index) or (t_dt not in syn_series.index) \
+           or (s_dt not in hedge_series.index) or (t_dt not in hedge_series.index):
             return None
-        rep_sub = rep_series.loc[s_dt:t_dt]
+
+        syn_sub = syn_series.loc[s_dt:t_dt]
         hedge_sub = hedge_series.loc[s_dt:t_dt]
-        # If the subperiod has only one observation, compute a direct return
-        if len(rep_sub) < 2 or len(hedge_sub) < 2:
-            rep_return = rep_series.loc[t_dt] / rep_series.loc[s_dt] - 1
-            hedge_return = hedge_series.loc[t_dt] / hedge_series.loc[s_dt] - 1
-            return (1 - weight) * rep_return + weight * hedge_return
-        # Compute quarterly returns
-        rep_ret = rep_sub.pct_change().dropna()
+
+        # If subperiod has only 1 or 2 points, direct ratio approach:
+        if len(syn_sub) < 2 or len(hedge_sub) < 2:
+            syn_return = syn_sub.iloc[-1]/syn_sub.iloc[0] - 1.0
+            hedge_return = hedge_sub.iloc[-1]/hedge_sub.iloc[0] - 1.0
+            return (1-weight)*syn_return + weight*hedge_return
+
+        # Otherwise, step through each quarter
+        syn_ret = syn_sub.pct_change().dropna()
         hedge_ret = hedge_sub.pct_change().dropna()
-        df = pd.DataFrame({"rep": rep_ret, "hedge": hedge_ret}).dropna()
+        df = pd.DataFrame({"syn": syn_ret, "hedge": hedge_ret}).dropna()
         if df.empty:
             return None
-        combined_ret = (1 - weight) * df["rep"] + weight * df["hedge"]
-        cum = (1 + combined_ret).cumprod()
-        return cum.iloc[-1] - 1
 
-    rep_cum = cum_dict.get("Representative Endowment", pd.Series(dtype=float))
+        combined_ret = (1-weight)*df["syn"] + weight*df["hedge"]
+        cum_ = (1 + combined_ret).cumprod()
+        return cum_.iloc[-1] - 1.0
+
+    syn_cum = cum_dict.get("Synthetic Endowment Index", pd.Series(dtype=float))
 
     for i, crisis in enumerate(rep_crises):
         cname = col_names[i]
         s_dt = crisis['Start']
-        t_dt = crisis['Trough']  # Use trough date for performance calculation
+        t_dt = crisis['Trough']
+        e_dt = crisis['End']
         mdd = crisis['Max Drawdown']
 
-        # Block 1: Representative Endowment drawdowns
-        data[cname][0] = str(s_dt.date())  # Peak Date
-        data[cname][1] = str(t_dt.date())    # Trough Date
-        data[cname][2] = f"{mdd:.1%}"         # Max Drawdown
+        # Block 1: Synthetic Endowment
+        data[cname][0] = str(s_dt.date())  # Peak
+        data[cname][1] = str(t_dt.date())  # Trough
+        data[cname][2] = str(e_dt.date())  # Recovery
+        data[cname][3] = f"{mdd:.1%}"
         len_q = approximate_quarters_diff(s_dt, t_dt)
-        data[cname][3] = f"{len_q}"
-        r_ttr = find_time_to_recovery_q(rep_cum, s_dt, t_dt) if (s_dt in rep_cum.index and t_dt in rep_cum.index) else None
-        data[cname][4] = f"{r_ttr}" if r_ttr else "n/a"
+        data[cname][4] = f"{len_q}"
+        if (s_dt in syn_cum.index) and (t_dt in syn_cum.index):
+            syn_ttr = find_time_to_recovery_q(syn_cum, s_dt, t_dt)
+            data[cname][5] = f"{syn_ttr}" if syn_ttr else "n/a"
+        else:
+            data[cname][5] = "n/a"
 
-        # Block 2: Hedge Strategy performance (peak-to-trough)
+        # Block 2: Hedge Strategy (peak->trough)
         offset_block2 = len(base_rows)
         for idx_h, strat_name in enumerate(hedge_strategies):
             row_idx = offset_block2 + idx_h
             strat_cum = cum_dict[strat_name]
             if s_dt in strat_cum.index and t_dt in strat_cum.index:
                 start_val = strat_cum.loc[s_dt]
-                end_val   = strat_cum.loc[t_dt]
+                trough_val = strat_cum.loc[t_dt]
                 if start_val <= 1e-9:
                     data[cname][row_idx] = "n/a"
                 else:
-                    perf = (end_val / start_val) - 1.0
+                    perf = (trough_val/start_val) - 1.0
                     data[cname][row_idx] = f"{perf:.1%}"
             else:
                 data[cname][row_idx] = "n/a"
 
-        # Block 3: 90/10 Overlay performance (peak-to-trough, rebalanced quarterly)
-        offset_block3 = len(base_rows) + len(hedge_strategies) + 1  # +1 for midrule2 marker
+        # Block 3: 90/10 overlays (peak->trough)
+        offset_block3 = len(base_rows) + len(hedge_strategies) + 1
         for idx_h, strat_name in enumerate(hedge_strategies):
             row_idx = offset_block3 + idx_h
-            overlay_perf = compute_overlay_performance(rep_cum, cum_dict[strat_name], s_dt, t_dt, weight=0.1)
+            overlay_perf = compute_overlay_performance(syn_cum, cum_dict[strat_name], s_dt, t_dt, weight=0.1)
             if overlay_perf is None:
                 data[cname][row_idx] = "n/a"
             else:
@@ -428,16 +437,13 @@ def pivot_crises_quarterly_expanded(rep_crises, cum_dict):
 
     return pd.DataFrame(data, index=final_rows)
 
-###############################################################################
-#     EXPORTER FOR THE EXPANDED TABLE
-###############################################################################
-def export_table_to_latex_pivot_expanded(df, description="Quarterly Crisis Table: Drawdowns, Hedge Strategy, and 90/10 Overlay Performance"):
+def export_table_to_latex_pivot_expanded(
+    df,
+    description="Quarterly Crisis Periods + Hedge Strategy Cumulative Performance (90/10 Overlays)"
+):
     """
-    Convert the pivot table to LaTeX code formatted for the Journal of Finance.
-    The table is structured in three blocks divided by midrules:
-      • Block 1: Representative Endowment drawdowns,
-      • Block 2: Hedge Strategy (Peak-to-Trough Returns),
-      • Block 3: Rep. Endowment + 10% Overlay Performance.
+    Convert the pivot table to LaTeX code formatted for the Journal of Finance style,
+    showing the new row "Recovery Date," and blocks for Hedge Strategy vs. Overlays.
     """
     columns = df.columns.tolist()
     align_str = "l" + "".join(["c"] * len(columns))
@@ -448,8 +454,8 @@ def export_table_to_latex_pivot_expanded(df, description="Quarterly Crisis Table
     lines.append(r"\begin{tiny}")
     lines.append(
         rf"\caption{{\normalsize{{{description}}}\\"  
-        r"\footnotesize{Major crisis periods are reported along with the drawdown characteristics of the Representative Endowment. "
-        r"Hedge strategy peak-to-trough returns and their corresponding 90/10 overlay performances are also presented.}}"
+        r"\footnotesize{Major crisis periods are shown. Hedge strategy returns and 90/10 overlays "
+        r"are measured peak-to-trough.}}"
     )
     lines.append(r"\label{table:hedge_crisis_jf}")
     lines.append(r"\begin{tabular*}{\linewidth}{@{\extracolsep{\fill}}" + align_str + r"}")
@@ -460,21 +466,23 @@ def export_table_to_latex_pivot_expanded(df, description="Quarterly Crisis Table
     lines.append(" & ".join(header) + r" \\")
     lines.append(r"\midrule")
 
-    # Insert Block 1 header
-    lines.append(r"\textbf{Representative Endowment} \\")
-    
-    # Iterate over the pivot table rows
-    for row_lbl in df.index:
+    # We'll place some textual blocks. We'll assume the "midrule1" or "midrule2" markers
+    # exist in the index or we do it by row offset.
+    row_labels = df.index.tolist()
+
+    # Insert a "Synthetic Endowment Index" label at the top block
+    lines.append(r"\textbf{Synthetic Endowment Index} \\")
+    for row_lbl in row_labels:
         if row_lbl == "midrule1":
             lines.append(r"\midrule")
             lines.append(r"\textbf{Hedge Strategy (Peak-to-Trough Returns)} \\")
             continue
         if row_lbl == "midrule2":
             lines.append(r"\midrule")
-            lines.append(r"\textbf{Rep. Endowment + 10\% Overlay Performance} \\")
+            lines.append(r"\textbf{Synthetic Endowment + 10\% Overlay Performance} \\")
             continue
 
-        # For detail rows, indent the row label
+        # Indent the row label a bit
         display_lbl = r"\quad " + row_lbl
         row_vals = [display_lbl]
         for col in columns:
@@ -483,25 +491,21 @@ def export_table_to_latex_pivot_expanded(df, description="Quarterly Crisis Table
                 val = val.replace("%", r"\%")
             row_vals.append(val)
         lines.append(" & ".join(row_vals) + r" \\")
-        
+
     lines.append(r"\bottomrule")
     lines.append(r"\end{tabular*}")
     lines.append(r"\end{tiny}")
     lines.append(r"\end{table}")
     return "\n".join(lines)
 
-
-
 ###############################################################################
-#                JF-STYLE CHART
+#                JF-STYLE CHART (WITH CRISIS SHADING)
 ###############################################################################
-def create_performance_chart_jof_matplotlib(cum_dict, dd_dict):
+def create_performance_chart_jof_matplotlib(cum_dict, dd_dict, crises=None):
     """
     2-row figure: top=cumulative, bottom=drawdowns, grayscale style.
     We'll fix legend so it doesn't go too far below.
-
-    Also ensure TSM lines are all dashed or somewhat consistent.
-    We'll do: if "Time Series Momentum" in label => dashed
+    Also, if 'crises' is provided, we shade from the start date to the end date in light gray.
     """
     fig, (ax1, ax2) = plt.subplots(nrows=2, ncols=1, sharex=True, figsize=(8,5))
 
@@ -510,19 +514,17 @@ def create_performance_chart_jof_matplotlib(cum_dict, dd_dict):
 
     label_map = {}
     for orig_label in cum_dict.keys():
-        if orig_label == "Representative Endowment":
-            label_map[orig_label] = "Rep. Endowment"
+        if orig_label == "Synthetic Endowment Index":
+            label_map[orig_label] = "Syn. Endowment Index"
         else:
             label_map[orig_label] = orig_label
 
-    tsm_colors = [
-        "dimgray", "gray", "darkgray", "silver", "lightgray"
-    ]
+    tsm_colors = ["dimgray", "gray", "darkgray", "silver", "lightgray"]
     tsm_color_index = 0
 
     def style_for_label(lbl: str):
         nonlocal tsm_color_index
-        if lbl == "Rep. Endowment":
+        if lbl == "Syn. Endowment Index":
             return dict(color='black', linestyle='solid', linewidth=1.2)
         elif lbl == "Public Equity":
             return dict(color='darkgray', linestyle='solid', linewidth=1.2)
@@ -533,38 +535,36 @@ def create_performance_chart_jof_matplotlib(cum_dict, dd_dict):
         else:
             return dict(color='dimgray', linestyle='solid', linewidth=1.2)
 
-    # top: cumulative
+    # Plot cumulative returns (top panel)
     for lbl, series_c in cum_dict.items():
         if series_c.empty:
             continue
         style_ = style_for_label(label_map[lbl])
         plt_series = series_c.dropna()
         if not plt_series.empty:
-            ax1.plot(
-                plt_series.index, plt_series.values,
-                label=label_map[lbl],
-                **style_
-            )
+            ax1.plot(plt_series.index, plt_series.values, label=label_map[lbl], **style_)
 
     ax1.set_ylabel("Cumulative Return", fontsize=8)
     ax1.tick_params(labelsize=8)
 
-    # bottom: drawdown
-    tsm_color_index = 0
+    # Plot drawdowns (bottom panel)
+    tsm_color_index = 0  # reset for TSM
     for lbl, series_c in dd_dict.items():
         if series_c.empty:
             continue
         style_ = style_for_label(label_map[lbl])
         plt_series = series_c.dropna()
         if not plt_series.empty:
-            ax2.plot(
-                plt_series.index, plt_series.values,
-                label=label_map[lbl],
-                **style_
-            )
+            ax2.plot(plt_series.index, plt_series.values, label=label_map[lbl], **style_)
 
     ax2.set_ylabel("Drawdown", fontsize=8)
     ax2.tick_params(labelsize=8)
+
+    # Shade crisis periods
+    if crises:
+        for crisis in crises:
+            ax1.axvspan(crisis['Start'], crisis['End'], color='lightgray', alpha=0.3, zorder=0)
+            ax2.axvspan(crisis['Start'], crisis['End'], color='lightgray', alpha=0.3, zorder=0)
 
     for ax in (ax1, ax2):
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
@@ -573,6 +573,7 @@ def create_performance_chart_jof_matplotlib(cum_dict, dd_dict):
 
     ax2.yaxis.set_major_formatter(PercentFormatter(1.0))
 
+    # Build legend without duplicates
     handles_top, labels_top = ax1.get_legend_handles_labels()
     handles_bot, labels_bot = ax2.get_legend_handles_labels()
     all_handles = handles_top + handles_bot
@@ -605,7 +606,7 @@ def create_performance_chart_jof_matplotlib(cum_dict, dd_dict):
 #                              MAIN APP
 ###############################################################################
 def main():
-    st.title("Quarterly Crisis Period Table + Cumulative Hedge Performance")
+    st.title("Quarterly Crisis Period Table + Cumulative Hedge Performance (Peak->Trough)")
 
     # 1) Load main data
     allocations, ret_q_full = load_and_preprocess_data()
@@ -613,12 +614,12 @@ def main():
     allocations, ret_q, q_start, q_end = unify_timeframe(allocations, ret_q_full.copy())
     idx_q = pd.date_range(q_start, q_end, freq='Q-DEC')
 
-    # Build Rep. Endowment (Q) using the unified timeframe
+    # Build Synthetic Endowment Index (Q) using the unified timeframe
     hist_alloc_q = map_allocations_to_periods(allocations, idx_q)
     valid_cols = hist_alloc_q.columns.intersection(ret_q.columns)
     hist_alloc_q, ret_q_hist = hist_alloc_q[valid_cols], ret_q[valid_cols]
-    rep_endw_q = (hist_alloc_q * ret_q_hist).sum(axis=1).dropna()
-    rep_cum, rep_dd = calculate_cumulative_and_dd(rep_endw_q)
+    syn_index_q = (hist_alloc_q * ret_q_hist).sum(axis=1).dropna()
+    syn_cum, syn_dd = calculate_cumulative_and_dd(syn_index_q)
 
     # 2) Load hedging strategies (monthly) => unify => resample to Q => build cumulative
     hedge_df = load_hedging_strategies()
@@ -626,12 +627,14 @@ def main():
     # resample to quarterly, picking last monthly data in each quarter
     hedge_q = hedge_df.resample('Q').last().dropna(how='all')
 
-    # Build cum_dict for original pivot
-    cum_dict = {"Representative Endowment": rep_cum}
-    # For Public Equity, use the full returns data (ret_q_full) so it always includes data since 2000.
+    # Build cum_dict for pivot (strictly quarterly data)
+    cum_dict = {"Synthetic Endowment Index": syn_cum}
+
+    # For Public Equity, ensure we also convert it to quarterly if present
     if "Public Equity" in ret_q_full.columns:
         pe_ = ret_q_full["Public Equity"].dropna()
-        pe_cum, _ = calculate_cumulative_and_dd(pe_)
+        pe_q = pe_.resample('Q').last().dropna()
+        pe_cum, _ = calculate_cumulative_and_dd(pe_q)
         cum_dict["Public Equity"] = pe_cum
 
     for col in hedge_q.columns:
@@ -640,42 +643,41 @@ def main():
             c_, _ = calculate_cumulative_and_dd(col_series)
             cum_dict[col] = c_
 
-    # 3) Identify crises using Rep. Endowment’s drawdowns
-    crises = find_crisis_periods_for_rep_endowment(rep_dd, threshold=0.05)
+    # 3) Identify crises using Synthetic Endowment Index drawdowns (≥5%)
+    crises = find_crisis_periods_for_rep_endowment(syn_dd, threshold=0.05)
 
-    # (Rest of your code remains unchanged...)
     # -------------------------------------------------------------------------
-    # 4) Original pivot table (unchanged)
+    # 4) Revised pivot table (peak->trough) + "Recovery Date"
     pivoted = pivot_crises_quarterly(crises, cum_dict)
-    st.subheader("Quarterly Crisis Table with Hedging Strategies: Cumulative Performance (Original)")
+    st.subheader("Quarterly Crisis Table with Hedging Strategies (Peak->Trough)")
     if pivoted.empty:
         st.warning("No crises found or no data to display.")
     else:
         st.dataframe(pivoted)
         latex_code = export_table_to_latex_pivot(
             pivoted,
-            description="Quarterly Crisis Periods + Hedge Strategy Cumulative Performance"
+            description="Quarterly Crisis Periods + Hedge Strategy Peak->Trough Performance"
         )
-        st.write("**LaTeX for the Crisis + Hedge Performance Table (Original):**")
+        st.write("**LaTeX (Revised Original Pivot):**")
         st.code(latex_code, language="latex")
 
     # -------------------------------------------------------------------------
-    # 5) Expanded pivot table with 90/10 rows
+    # 5) Expanded pivot table with 90/10 rows, also peak->trough
     expanded_pivot = pivot_crises_quarterly_expanded(crises, cum_dict)
-    st.subheader("Quarterly Crisis Table with Hedging Strategies + 90/10 Overlays")
+    st.subheader("Quarterly Crisis Table with Hedging Strategies + 90/10 Overlays (Peak->Trough)")
     if expanded_pivot.empty:
         st.warning("No crises found or no data to display (expanded).")
     else:
         st.dataframe(expanded_pivot)
         latex_expanded = export_table_to_latex_pivot_expanded(
             expanded_pivot,
-            description="Quarterly Crisis Periods + Hedge Strategy Cumulative Performance (90/10 Overlays)"
+            description="Quarterly Crisis Periods + Hedge Strategy (Peak->Trough) + 90/10 Overlays"
         )
-        st.write("**LaTeX for the Crisis + Hedge Performance Table (Expanded 90/10):**")
+        st.write("**LaTeX (Expanded Pivot with Recovery Date):**")
         st.code(latex_expanded, language="latex")
 
     # -------------------------------------------------------------------------
-    # 6) JF-style Chart
+    # 6) JF-style Chart with shading
     dd_dict = {}
     for lbl, series_c in cum_dict.items():
         if series_c.empty:
@@ -684,15 +686,37 @@ def main():
             run_max = series_c.cummax()
             dd_ = (series_c - run_max) / run_max
             dd_dict[lbl] = dd_
-    st.subheader("Cumulative & Drawdown Chart (JF-Style)")
-    fig = create_performance_chart_jof_matplotlib(cum_dict, dd_dict)
+
+    st.subheader("Cumulative & Drawdown Chart (JF-Style) with Crisis Shading")
+    fig = create_performance_chart_jof_matplotlib(cum_dict, dd_dict, crises=crises)
     st.pyplot(fig)
 
-    st.write("Above chart compares the Representative Endowment, Public Equity, "
-             "and each hedging strategy on a cumulative-return and drawdown basis, "
-             "sampled quarterly. Time Series Momentum lines are dashed and share "
-             "a similar style. The legend is placed just below the x-axis labels "
-             "to avoid overlap.")
+    # Determine the earliest and latest dates across all quarterly series
+    min_date, max_date = None, None
+    for series_label, series_data in cum_dict.items():
+        if not series_data.empty:
+            smin = series_data.index.min()
+            smax = series_data.index.max()
+            if (min_date is None) or (smin < min_date):
+                min_date = smin
+            if (max_date is None) or (smax > max_date):
+                max_date = smax
+
+    if min_date and max_date:
+        date_range_info = (
+            f"The series are displayed from {min_date.strftime('%Y-%m-%d')} "
+            f"to {max_date.strftime('%Y-%m-%d')}, at a quarterly frequency."
+        )
+    else:
+        date_range_info = "No valid date range found (empty data)."
+
+    st.write(
+        "All hedge performances are measured from the crisis peak date to the trough date. "
+        "A new 'Recovery Date' row is included for reference, but does not affect the "
+        "performance calculations. The table's 'Time to Recovery' columns refer to how many "
+        "quarters it took for the Synthetic Endowment (or Public Equity) to regain its peak "
+        f"levels after the trough.\n\n**Date Range**: {date_range_info}"
+    )
 
 
 if __name__ == "__main__":
