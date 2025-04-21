@@ -1,186 +1,127 @@
+# pages/robustness.py
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-import matplotlib.cm as cm
+from matplotlib.ticker import PercentFormatter
+from matplotlib import rcParams
+from decimal import Decimal, ROUND_HALF_UP
 
-# ──────────────────────────────────────────────────────────────────────
-# I.  DATA HELPERS
-# ──────────────────────────────────────────────────────────────────────
-def load_endowment_allocations_and_returns():
-    alloc_cols = ["Year","Public Equity","PE/VC","Hedge Funds",
-                  "Real Assets & ILBs","Fixed Income","Private Credit","Cash"]
-    alloc = pd.read_csv("data/hist_endowment_saa.csv",sep=";",header=0,names=alloc_cols)
-    alloc_long = alloc.melt(id_vars=["Year"],var_name="Asset Class",
-                            value_name="Allocation").astype({"Allocation":float})
-    alloc_long["Start"] = pd.to_datetime(alloc_long["Year"].astype(str))+pd.DateOffset(months=6)
-    alloc_long["End"]   = alloc_long["Start"]+pd.DateOffset(years=1)-pd.DateOffset(days=1)
+from utils import (
+    load_asset_allocation_and_returns_data,
+    map_allocations_to_periods,
+    load_hedge_strategies,
+    calculate_cumulative_returns_and_drawdowns,
+    calculate_sei_returns,
+    trend_sensitivity,
+    detect_crisis_periods,
+    protection_cost_ratio,
+    cost_adjusted_risk_reduction,
+    median_crisis_payoff,
+)
 
-    ret_q = pd.read_csv("data/quarterly_returns.csv",sep=";",header=0)
-    ret_q["Date"] = pd.to_datetime(ret_q["Date"],format="%d.%m.%Y",errors="coerce")
-    ret_q.set_index("Date",inplace=True)
-    ret_q.index = ret_q.index + pd.offsets.MonthEnd(0)
-    for c in ret_q.columns:
-        if ret_q[c].dtype=="O":
-            ret_q[c]=ret_q[c].str.replace("%","",regex=False).replace("",np.nan).astype(float)/100
-    anchor=pd.Timestamp("1999-07-31")
-    if anchor not in ret_q.index:
-        ret_q.loc[anchor]=0.0
-    ret_q.sort_index(inplace=True)
-    return alloc_long, ret_q
+# ------------------------------------------------------------------
+# Debug switch (visible in Streamlit sidebar)
+if "Debug" not in st.session_state:
+    st.session_state["Debug"] = False
+with st.sidebar:
+    st.checkbox("Debug TSM numbers", key="Debug")
+# ------------------------------------------------------------------
+
+
+rcParams.update({
+    "font.family": "serif",
+    "font.size": 9,
+    "axes.linewidth": 0.8,
+})
+
+
+
+def pct_1dig(x: float | None) -> str:
+    """Format x (a proportion, e.g. 0.234) as 1‑digit % with ROUND_HALF_UP."""
+    if x is None or pd.isna(x):
+        return "NA"
+    return f"{Decimal(x*100).quantize(Decimal('0.1'), rounding=ROUND_HALF_UP)}%"
+
+def peak_to_trough(cum_series: pd.Series, start: pd.Timestamp, trough: pd.Timestamp) -> float:
+    """
+    Raw (not annualized) return from start → trough:
+      (cum_trough / cum_start) - 1
+    """
+    if start not in cum_series.index or trough not in cum_series.index:
+        return np.nan
+    return cum_series.loc[trough] / cum_series.loc[start] - 1
 
 
 def unify_timeframe(alloc, ret):
-    start=max(alloc["Start"].min(),ret.index.min())
-    end  =min(alloc["End"].max(), ret.index.max())
-    return alloc[(alloc["End"]>=start)&(alloc["Start"]<=end)], ret.loc[start:end], start, end
+    start = max(alloc["Start Date"].min(), ret.index.min())
+    end = min(alloc["End Date"].max(), ret.index.max())
+    alloc_f = alloc[(alloc["End Date"] >= start) & (alloc["Start Date"] <= end)]
+    ret_f   = ret.loc[start:end]
+    return alloc_f, ret_f, start, end
 
 
-def map_alloc(alloc_long, idx_q):
-    out=pd.DataFrame(index=idx_q)
-    for asset in alloc_long["Asset Class"].unique():
-        sub=alloc_long[alloc_long["Asset Class"]==asset]
-        for _,r in sub.iterrows():
-            rng=pd.date_range(r["Start"],r["End"],freq=idx_q.freq)
-            out.loc[out.index.intersection(rng),asset]=r["Allocation"]
-    return out.fillna(0.0)
+def quarters_diff(d1, d2):
+    days = (d2 - d1).days
+    return max(int(round(days / 91.3125)), 1)
 
 
-def calc_cum_dd(r):
-    cum=(1+r).cumprod()
-    dd=cum.div(cum.cummax())-1
-    return cum, dd
-
-
-def load_hedges():
-    df = pd.read_csv("data/hedging_strategies.csv", sep=";")
-    df["Date"] = pd.to_datetime(df["Date"], format="%d.%m.%Y")
-    df.set_index("Date", inplace=True)
-    df.index += pd.offsets.MonthEnd(0)
-
-    for col in df.columns:
-        # Ensure that missing data points are treated as NaN and not 0
-        df[col] = df[col].apply(lambda x: pd.to_numeric(x.replace("%", ""), errors='coerce') / 100 if pd.notnull(x) else np.nan)
-    
-    df.sort_index(inplace=True)
-    return df
-
-
-# ──────────────────────────────────────────────────────────────────────
-# II.  CRISIS LOGIC
-# ──────────────────────────────────────────────────────────────────────
-def detect_crises(dd, thresh):
-    dd=dd.dropna()
-    crises,in_c=False,False
-    start=trough=maxdd=None
-    out=[]
-    for d,v in dd.items():
-        if not in_c and v<=-thresh:
-            in_c=True
-            s_prev=dd.loc[:d][dd.loc[:d]==0].last_valid_index()
-            start=s_prev if s_prev is not None else d
-            trough=d; maxdd=v
-        if in_c:
-            if v<maxdd: maxdd=v; trough=d
-            if v==0:
-                out.append({"Start":start,"Trough":trough,"End":d,"Max":maxdd})
-                in_c=False
-    if in_c:
-        out.append({"Start":start,"Trough":trough,"End":dd.index[-1],"Max":maxdd})
-    return out
-
-
-def peak_to_trough(cum, s, t):
+def build_crisis_table(crises, cum_hedge):
     """
-    Calculate the peak-to-trough return for the hedge strategy during the crisis.
-    If the crisis time period is not fully covered by the hedge data, return NaN ("NA").
-    """
-    # Ensure that both the start (s) and trough (t) are present in the cumulative return series
-    if (s not in cum.index) or (t not in cum.index):
-        return np.nan  # Return NaN if the crisis period isn't fully covered by the hedge data
-    
-    return cum.loc[t] / cum.loc[s] - 1
+    Build a dataframe of peak‑to‑trough pay‑offs for each hedge overlay
+    in every crisis window.
 
-
-def quarters(a,b):
-    return max(int(round((b-a).days/91.3125)),1)
-
-
-# ──────────────────────────────────────────────────────────────────────
-# III.  BUILD TABLE
-# ──────────────────────────────────────────────────────────────────────
-def build_crisis_table(crises, cum_hedge_dict):
-    """
-    Builds a crisis table with the hedge performance (peak-to-trough) for each crisis.
-    If hedge strategy data is not available for the full crisis period, it will show "NA".
+    * Hedge columns are returned as raw floats (or NaN) — no formatting here.
+    * Summary rows (mean / median) are also stored as floats.
     """
     if not crises:
         return pd.DataFrame()
 
-    hedge_cols = list(cum_hedge_dict.keys())
+    hedge_keys = list(cum_hedge.keys())
     rows = []
 
-    for i, c in enumerate(crises, start=1):
-        s_dt, t_dt, e_dt, max_dd = c["Start"], c["Trough"], c["End"], c["Max"]
-
+    for idx, c in enumerate(crises, start=1):
+        s, t, e, md = c["Start"], c["Trough"], c["End"], c["Max Drawdown"]
         row = {
-            "#": i,
-            "Start": s_dt.date(),
-            "Trough": t_dt.date(),
-            "End": e_dt.date(),
-            "Max DD": f"{max_dd:.1%}",
-            "Depth (Q)": quarters(s_dt, t_dt),
-            "To Rec (Q)": quarters(t_dt, e_dt),
+            "#": idx,
+            "Start":   s.date(),
+            "Trough":  t.date(),
+            "End":     e.date(),
+            "Max DD":  f"{md:.1%}",
+            "Depth(Q)": quarters_diff(s, t),
+            "Recov(Q)": quarters_diff(t, e),
         }
-
-        # ▸ hedge peak‑to‑trough returns (with coverage check)
-        for hcol in hedge_cols:
-            series = cum_hedge_dict[hcol]
-            # Ensure the hedge data covers the entire crisis period
-            if s_dt >= series.index.min() and t_dt <= series.index.max():  
-                pt_val = peak_to_trough(series, s_dt, t_dt)
-            else:
-                pt_val = np.nan  # Set to NaN if the hedge data does not cover the crisis period
-            row[hcol] = "NA" if pd.isna(pt_val) else f"{pt_val:.1%}"
-
+        # --- store raw float pay‑offs (no rounding yet) ---------------
+        for h in hedge_keys:
+            row[h] = peak_to_trough(cum_hedge[h], s, t)
         rows.append(row)
 
     df = pd.DataFrame(rows)
 
-    # ▸ summary rows (average and median)
-    def make_summary_row(func, label):
-        r = {k: "" for k in df.columns}
-        r["#"], r["Max DD"] = label, f"--{label}--"
-        for h in hedge_cols:
-            pct = (
-                df[h].replace("NA", np.nan)
-                     .str.rstrip("%").astype(float) / 100
-            )
-            val = getattr(pct.dropna(), func)(skipna=True)
-            r[h] = "NA" if pd.isna(val) else f"{val:.1%}"
-        return r
+    # ---------- summary helper (mean / median) -----------------------
+    def summary(stat, label):
+        out = {c: "" for c in df.columns}
+        out["#"], out["Max DD"] = label, f"--{label}--"
+        for h in hedge_keys:
+            v = getattr(df[h].dropna().astype(float), stat)()
+            out[h] = v
+        return out
 
     df = pd.concat(
         [df,
-         pd.DataFrame([make_summary_row("mean", "ALL AVG"),
-                       make_summary_row("median", "ALL MED")])],
-        ignore_index=True,
+         pd.DataFrame([summary("mean", "ALL AVG"),
+                       summary("median", "ALL MED")])],
+        ignore_index=True
     )
     return df
 
 
-# ──────────────────────────────────────────────────────────────────────
-# IV. Convert a crisis table → LaTeX  (UPDATED only in one line)
-# ──────────────────────────────────────────────────────────────────────
 def to_latex(df, title, threshold):
-    """
-    Minimal LaTeX table.  Ensure missing values are shown as "NA" for better clarity.
-    """
-    align = "l" + "c" * (df.shape[1] - 1)
+    align = "l" + "c"*(df.shape[1]-1)
     caption = (
         rf"\caption{{\normalsize{{{title}}}\\" +
-        rf"\footnotesize{{Drawdown threshold: {threshold:.1f}\%}}}}"
+        rf"\footnotesize{{Drawdown threshold: {threshold*100:.1f}\%}}}}"
     )
     lines = [
         r"\begin{table}[!ht]",
@@ -189,266 +130,237 @@ def to_latex(df, title, threshold):
         caption,
         rf"\label{{table:{title.lower().replace(' ','_')}}}",
         rf"\begin{{tabular*}}{{\linewidth}}{{@{{\extracolsep{{\fill}}}}{align}}}",
-        r"\toprule",
+        r"\toprule"
     ]
-    # (rest of the function is unchanged)
-    col_list = df.columns.tolist()
-    lines.append(" & ".join([""] + col_list) + r" \\")
+    cols = df.columns.tolist()
+    lines.append(" & ".join([""]+cols) + r" \\")
     lines.append(r"\midrule")
-    
-    # Replace NaN with 'NA' for missing data
     for _, row in df.iterrows():
-        lines.append(" & ".join([str(row[c]).replace('nan', 'NA') for c in col_list]) + r" \\")
-    
-    lines += [r"\bottomrule", r"\end{tabular*}", r"\end{tiny}", r"\end{table}"]
+        cells = [str(row[c]).replace("%", r"\%") for c in cols]
+        lines.append(" & ".join(cells) + r" \\")
+    lines += [
+        r"\bottomrule",
+        r"\end{tabular*}",
+        r"\end{tiny}",
+        r"\end{table}"
+    ]
     return "\n".join(lines)
 
 
-
-# ──────────────────────────────────────────────────────────────────────
-# V.  TSM‑MEDIAN CHART  (10 % threshold)
-# ──────────────────────────────────────────────────────────────────────
-TSM_MAP={4:"V Fast",7:"Fast",12:"Med",20:"Slow",24:"V Slow"}
-
-def median_tsm_by_speed(dd_series, crises, cum_hedge):
-    """
-    returns a dict {speed: median_peak‑to‑trough_return}
-    for the five TSM columns, given a list of crises for a portfolio.
-    """
-    out={}
-    for w,col in TSM_MAP.items():
-        vals=[]
-        if col not in cum_hedge:        # column missing → skip
-            out[w]=np.nan; continue
-        for c in crises:
-            vals.append(peak_to_trough(cum_hedge[col],c["Start"],c["Trough"]))
-        out[w]=np.nan if not vals else float(np.median(vals))
-    return out
+def generate_crisis_table(name, crises, cum_hedge, threshold):
+    st.subheader(f"{name} — {int(threshold*100)}% Threshold")
+    df = build_crisis_table(crises, cum_hedge)
+    st.dataframe(df, height=300)
+    st.code(to_latex(df, f"{name} Crises {int(threshold*100)}%", threshold), language="latex")
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Extra helper for the TSM chart   (NEW / REPLACEMENT)
-# ──────────────────────────────────────────────────────────────────────
-# helper → fixed mapping from speed (weeks) → column name in hedges CSV
-# ---------------------------------------------------------------------
-def trend_sensitivity():
-    """
-    Return the list of trend speeds (in weeks) that correspond to the
-    five TSM columns inside hedging_strategies.csv.
-          Very Fast = 4 w,  Fast = 7 w,  Medium = 12 w,
-          Slow = 20 w,      Very Slow = 24 w
-    """
-    return [4, 7, 12, 20, 24]
+def generate_crisis_plot(crises, cum_hedge, trend_sens, threshold):
+    st.write(f"### {int(threshold*100)}% Threshold")
 
-def compute_tsm_medians(cum_hedge_dict, crises_dict, trend_sens):
-    """
-    Parameters
-    ----------
-    cum_hedge_dict : dict
-        {strategy_name : cumulative_index_series}
-        (already built in main from hedge_q)
-        must contain the five TSM columns:
-        'V Fast','Fast','Med','Slow','V Slow'
-    crises_dict : dict
-        {"PuE": [list_of_crisis_dicts],  "SEI": [...] }
-        crisis_dict items are exactly those you pass to build_crisis_table
-    trend_sens : list[int]
-        [ 4, 7, 12, 20, 24 ]
-    Returns
-    -------
-    pe_median_list , sei_median_list, pe_mean_list, sei_mean_list
-        four lists of the same length as trend_sens
-        NaN where a given TSM column is unavailable
-    """
-    speed_to_col = {4: "V Fast",
-                    7: "Fast",
-                    12: "Med",
-                    20: "Slow",
-                    24: "V Slow"}
+    # map speeds to hedge‐column names
+    speed2col = {4: "V Fast", 7: "Fast", 12: "Med", 20: "Slow", 24: "V Slow"}
 
-    def series_stats(crises, col_name):
-        if col_name not in cum_hedge_dict:
-            return np.nan, np.nan
-        cum = cum_hedge_dict[col_name]
-        vals = [peak_to_trough(cum, c["Start"], c["Trough"]) for c in crises]
-        # filter NaN & None
-        vals = [v for v in vals if pd.notna(v)]
-        if not vals:
-            return np.nan, np.nan
-        return float(np.nanmedian(vals)), float(np.nanmean(vals))
+    # build median+mean lists
+    def stats_for(cr):
+        med, mn = [], []
+        for sp in trend_sens:
+            col = speed2col[sp]
+            vals = [peak_to_trough(cum_hedge[col], c["Start"], c["Trough"]) for c in cr]
+            vals = [v for v in vals if pd.notna(v)]
+            med.append(np.nanmedian(vals) if vals else np.nan)
+            mn.append(np.nanmean(vals)   if vals else np.nan)
+        return med, mn
 
-    pe_med, sei_med, pe_mean, sei_mean = [], [], [], []
-    for spd in trend_sens:
-        col = speed_to_col[spd]
-        pe_m, pe_mu = series_stats(crises_dict["PuE"],  col)
-        sei_m, sei_mu = series_stats(crises_dict["SEI"], col)
-        pe_med.append(pe_m)
-        sei_med.append(sei_m)
-        pe_mean.append(pe_mu)
-        sei_mean.append(sei_mu)
+    pe_med, pe_mean = stats_for(crises["Public Equity"])
+    sei_med, sei_mean = stats_for(crises["Synthetic Endowment"])
 
-    return pe_med, sei_med, pe_mean, sei_mean
+    fig, ax = plt.subplots(figsize=(5,3.5))
+    colors = {"Public Equity":"black", "Synthetic Endowment":"dimgray"}
+
+    ax.plot(trend_sens, pe_med,   "o-", label="PuE Median",  color=colors["Public Equity"])
+    ax.plot(trend_sens, pe_mean,  "s--",label="PuE Mean",    color=colors["Public Equity"])
+    ax.plot(trend_sens, sei_med,  "o-", label="SEI Median",  color=colors["Synthetic Endowment"])
+    ax.plot(trend_sens, sei_mean, "s--",label="SEI Mean",    color=colors["Synthetic Endowment"])
+
+    ax.set_xlabel("Trend Sensitivity (weeks)")
+    ax.set_ylabel("Peak–Trough Return")
+    ax.set_xticks(trend_sens)
+    ax.set_xlim(min(trend_sens)-1, max(trend_sens)+1)
+    ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+    ax.grid(axis="y", linestyle="--", lw=0.5, alpha=0.7)
+    for sp in ["top","right"]:
+        ax.spines[sp].set_visible(False)
+
+    ax.legend(ncol=2, frameon=False, fontsize=8, loc="upper center", bbox_to_anchor=(0.5,1.12))
+    fig.tight_layout(pad=0.5)
+    st.pyplot(fig)
 
 
-# ──────────────────────────────────────────────────────────────────────
-# V.  MAIN PAGE
-# ──────────────────────────────────────────────────────────────────────
-# ──────────────────────────────────────────────────────────────────────
-# V.  Main Streamlit page  (FULLY REWRITTEN)
-# ──────────────────────────────────────────────────────────────────────
-# ──────────────────────────────────────────────────────────────────────
+def process_threshold(th, cum_pe, dd_pe, cum_sei, dd_sei, cum_hedge, trend_sens):
+    pe_cr = detect_crisis_periods(dd_pe, th)
+    se_cr = detect_crisis_periods(dd_sei, th)
+
+    generate_crisis_table("Public Equity", pe_cr, cum_hedge, th)
+    generate_crisis_table("Synthetic Endowment", se_cr, cum_hedge, th)
+    generate_crisis_plot({"Public Equity":pe_cr, "Synthetic Endowment":se_cr},
+                         cum_hedge, trend_sens, th)
+
+
+def process_top_crises(cum_pe, dd_pe, cum_sei, dd_sei, cum_hedge, trend_sens, n=4):
+    top_pe  = sorted(detect_crisis_periods(dd_pe), key=lambda c: abs(c["Max Drawdown"]), reverse=True)[:n]
+    top_sei = sorted(detect_crisis_periods(dd_sei),key=lambda c: abs(c["Max Drawdown"]), reverse=True)[:n]
+    st.header(f"Top {n} Largest Crises")
+    generate_crisis_table("Public Equity", top_pe, cum_hedge, 0.0)
+    generate_crisis_table("Synthetic Endowment", top_sei, cum_hedge, 0.0)
+    generate_crisis_plot({"Public Equity":top_pe, "Synthetic Endowment":top_sei},
+                         cum_hedge, trend_sens, 0.0)
+    
+###############################################################################
+#          FAST vs SLOW TSM — 10 % CRISIS TABLE  (LEVEL‑BASED PAY‑OFF)
+###############################################################################
+def debug_single_hedge(cum: pd.Series, crises: list[dict], label: str):
+    """Print raw peak‑to‑trough pay‑offs so we can compare with LaTeX table."""
+    rows = []
+    for c in crises:
+        if c["Start"] in cum.index and c["Trough"] in cum.index:
+            payoff = cum.loc[c["Trough"]] / cum.loc[c["Start"]] - 1
+            rows.append({
+                "Start":   c["Start"].date(),
+                "Trough":  c["Trough"].date(),
+                "Payoff":  f"{payoff:.1%}"
+            })
+    if rows:
+        st.write(f"#### Debug – raw pay‑offs for {label}")
+        st.table(pd.DataFrame(rows))
+        st.write("Median =", pd.Series(
+            [float(r["Payoff"].rstrip('%')) / 100 for r in rows]).median().round(4))
+
+###############################################################################
+#      FAST vs SLOW TSM — Table with RELATIVE IMPROVEMENTS
+#      (carry = geometric CAGR of MONTHLY returns  ← original version)
+###############################################################################
+def tsm_speed_table(idx_q: pd.DatetimeIndex,
+                    pu_ret: pd.Series,
+                    sei_ret: pd.Series,
+                    hedge_monthly: pd.DataFrame,
+                    threshold: float = 0.10) -> None:
+
+    # 1 ─ crisis windows on PuE and SEI
+    _, dd_pu  = calculate_cumulative_returns_and_drawdowns(pu_ret)
+    _, dd_sei = calculate_cumulative_returns_and_drawdowns(sei_ret)
+    pu_cr  = detect_crisis_periods(dd_pu,  threshold)
+    sei_cr = detect_crisis_periods(dd_sei, threshold)
+
+    # 2 ─ cumulative TSM indices on quarter‑ends
+    tags = {"V Fast", "Fast", "Med", "Slow", "V Slow"}
+    cum_q = {}
+    for col in hedge_monthly:
+        if ("momentum" in col.lower()) or (col.strip() in tags):
+            cum = (1 + hedge_monthly[col].dropna()).cumprod()
+            cum_q[col] = cum.asfreq("QE-DEC", method="ffill").reindex(idx_q)
+
+    if not cum_q:
+        st.warning("No TSM data found.");  return
+
+    # 3 ─ keep crises fully covered by all overlays
+    def covered(cr):
+        s, t = cr["Start"], cr["Trough"]
+        return all((s in srs.index and t in srs.index
+                    and not (pd.isna(srs.loc[s]) or pd.isna(srs.loc[t])))
+                   for srs in cum_q.values())
+
+    pu_cr  = [c for c in pu_cr  if covered(c)]
+    sei_cr = [c for c in sei_cr if covered(c)]
+
+    pt = lambda ser, cr: ser.loc[cr["Trough"]] / ser.loc[cr["Start"]] - 1
+
+    rows = []
+    for name in cum_q:
+        cum_qtr = cum_q[name].dropna()
+        if cum_qtr.empty:
+            continue
+
+        # crisis pay‑offs
+        pu_vals  = [pt(cum_qtr, c) for c in pu_cr]
+        sei_vals = [pt(cum_qtr, c) for c in sei_cr]
+
+        med_pu,  med_sei  = map(np.nanmedian, (pu_vals, sei_vals))
+        mean_pu, mean_sei = map(np.nanmean,  (pu_vals, sei_vals))
+
+        # ── ORIGINAL carry: CAGR of MONTHLY returns from hedge_monthly
+        ret_m  = hedge_monthly[name].dropna()
+        years  = len(ret_m) / 12
+        carry  = (1 + ret_m).prod()**(1 / years) - 1
+        # -------------------------------------------------------------------
+
+        pcr_pu  = protection_cost_ratio(med_pu,  carry)
+        pcr_sei = protection_cost_ratio(med_sei, carry)
+
+        rows.append({
+            "Strategy": name,
+            "Speed": ("Fast" if "fast" in name.lower()
+                      else "Slow" if any(x in name.lower() for x in ("slow", "med"))
+                      else "Other"),
+            "Median PuE":  med_pu,
+            "Median SEI":  med_sei,
+            "Mean PuE":    mean_pu,
+            "Mean SEI":    mean_sei,
+            "Rel Median":  None if med_pu  == 0 else med_sei  / med_pu  - 1,
+            "Rel Mean":    None if mean_pu == 0 else mean_sei / mean_pu - 1,
+            "PCR PuE":     pcr_pu,
+            "PCR SEI":     pcr_sei,
+            "Rel PCR":     None if pcr_pu  == 0 else pcr_sei  / pcr_pu  - 1,
+            "Annualised Carry %": carry * 100,
+        })
+
+    if not rows:
+        st.info("No crises with full TSM coverage."); return
+
+    df = pd.DataFrame(rows).set_index("Strategy")
+
+    pct1 = lambda x: "NA" if pd.isna(x) else f"{x*100:.1f}%"
+    two  = "{:.2f}".format
+    fmt  = {"Median PuE": pct1, "Median SEI": pct1,
+            "Mean PuE":   pct1, "Mean SEI":   pct1,
+            "Rel Median": pct1, "Rel Mean":   pct1,
+            "PCR PuE":    two,  "PCR SEI":    two,  "Rel PCR": two,
+            "Annualised Carry %": "{:.2f}"}
+
+    st.subheader("Fast vs Slow TSM (10 % drawdown, relative improvements)")
+    st.dataframe(df.style.format(fmt), height=420)
+
+
+
 def main():
-    st.title("Robustness Checks — thresholds, largest drawdowns & TSM chart")
+    st.title("Robustness Checks — thresholds, largest drawdowns & TSM")
 
-    # 1. Define the trend sensitivity
-    trend_sens = trend_sensitivity()  # [4, 7, 12, 20, 24]
+    alloc, ret_q = load_asset_allocation_and_returns_data()
+    alloc_f, ret_f, start, end = unify_timeframe(alloc, ret_q)
 
-    # 2. Load data
-    alloc_long, ret_q = load_endowment_allocations_and_returns()
-    alloc_long, ret_q, start_dt, end_dt = unify_timeframe(alloc_long, ret_q)
+    idx_q = pd.date_range(start, end, freq="QE-DEC")
+    sei_ret = calculate_sei_returns(alloc_f, ret_f).reindex(idx_q).dropna()
+    pe_ret  = ret_f["Public Equity"].reindex(idx_q).dropna()
 
-    idx_q = pd.date_range(start_dt, end_dt, freq="Q")
+    cum_sei, dd_sei = calculate_cumulative_returns_and_drawdowns(sei_ret)
+    cum_pe,  dd_pe  = calculate_cumulative_returns_and_drawdowns(pe_ret)
 
-    # Synthetic Endowment & Public-Equity returns
-    weights_df = map_alloc(alloc_long, idx_q)
-    sei_r = (weights_df[weights_df.columns.intersection(ret_q.columns)] *
-             ret_q).sum(axis=1)
-    pe_r  = ret_q["Public Equity"].reindex(idx_q).fillna(0.0)
+    hedge_df = load_hedge_strategies()
+    cum_hedge = {
+        name: calculate_cumulative_returns_and_drawdowns(ser.dropna())[0]
+        for name, ser in hedge_df.items() if ser.dropna().size>1
+    }
 
-    cum_sei, dd_sei = calc_cum_dd(sei_r)
-    cum_pe,  dd_pe  = calc_cum_dd(pe_r)
+    trend_sens = trend_sensitivity()
 
-    # 3. Load hedges
-    hedge_q = load_hedges().resample("Q").last().reindex(idx_q).fillna(0.0)
-    cum_hedge = {c: calc_cum_dd(ser.dropna())[0]
-                 for c, ser in hedge_q.items() if ser.dropna().size > 1}
+    for thr in [0.10, 0.075, 0.125]:
+        st.header(f"{int(thr*100)}% Threshold")
+        process_threshold(thr, cum_pe, dd_pe, cum_sei, dd_sei, cum_hedge, trend_sens)
 
-    # ----- 10 % crisis tables -----
-    thr = 0.10
-    crises_pe  = detect_crises(dd_pe,  thr)
-    crises_sei = detect_crises(dd_sei, thr)
-    for name, crises in [("Public Equity", crises_pe),
-                         ("Synthetic Endowment", crises_sei)]:
-        st.header(f"{name} — 10 % threshold")
-        df = build_crisis_table(crises, cum_hedge)
-        st.dataframe(df, height=350)
-        st.code(to_latex(df, f"{name} Crises 10%", 10.0), language="latex")
+    process_top_crises(cum_pe, dd_pe, cum_sei, dd_sei, cum_hedge, trend_sens, n=4)
 
-    # ----- 10 % Threshold plot -----
-    st.header("10% Threshold Crisis Response")
-    pe_med_10, sei_med_10, pe_mean_10, sei_mean_10 = compute_tsm_medians(
-        cum_hedge,
-        {"PuE": crises_pe, "SEI": crises_sei},
-        trend_sens
-    )
-    
-    fig_10, ax_10 = plt.subplots(figsize=(7.5, 5))
-    ax_10.plot(trend_sens, pe_med_10,  marker="o", label="Public Equity (Median)", color="tab:blue")
-    ax_10.plot(trend_sens, sei_med_10, marker="o", label="Synthetic Endowment (Median)", color="tab:orange")
-    ax_10.plot(trend_sens, pe_mean_10, marker="x", linestyle="--", label="Public Equity (Mean)", color="tab:blue")
-    ax_10.plot(trend_sens, sei_mean_10, marker="x", linestyle="--", label="Synthetic Endowment (Mean)", color="tab:orange")
-    ax_10.set_xlabel("Trend Sensitivity (weeks)")
-    ax_10.set_ylabel("Crisis Response (Peak–Trough Return)")
-    ax_10.set_title("TSM Hedge Efficacy for 10% Threshold")
-    ax_10.set_xticks(trend_sens)
-    ax_10.grid(True, ls="--", lw=0.5)
-    ax_10.legend()
-    st.pyplot(fig_10)
+    # ------------------ TSM speed table ------------------------------
+    tsm_speed_table(idx_q, pe_ret, sei_ret, hedge_df, 0.10)
 
-    # ----- 7.5% threshold tables -----
-    st.header("Public Equity and Synthetic Endowment — 7.5% Threshold")
-    thr = 0.075
-    crises_pe_75  = detect_crises(dd_pe,  thr)
-    crises_sei_75 = detect_crises(dd_sei, thr)
-    for name, crises in [("Public Equity", crises_pe_75),
-                         ("Synthetic Endowment", crises_sei_75)]:
-        df_75 = build_crisis_table(crises, cum_hedge)
-        st.dataframe(df_75, height=350)
-        st.code(to_latex(df_75, f"{name} Crises 7.5%", 7.5), language="latex")
-
-    # ----- 7.5% Threshold plot -----
-    st.header("7.5% Threshold Crisis Response")
-    pe_med_75, sei_med_75, pe_mean_75, sei_mean_75 = compute_tsm_medians(
-        cum_hedge,
-        {"PuE": crises_pe_75, "SEI": crises_sei_75},
-        trend_sens
-    )
-    
-    fig_75, ax_75 = plt.subplots(figsize=(7.5, 5))
-    ax_75.plot(trend_sens, pe_med_75,  marker="o", label="Public Equity (Median)", color="tab:blue")
-    ax_75.plot(trend_sens, sei_med_75, marker="o", label="Synthetic Endowment (Median)", color="tab:orange")
-    ax_75.plot(trend_sens, pe_mean_75, marker="x", linestyle="--", label="Public Equity (Mean)", color="tab:blue")
-    ax_75.plot(trend_sens, sei_mean_75, marker="x", linestyle="--", label="Synthetic Endowment (Mean)", color="tab:orange")
-    ax_75.set_xlabel("Trend Sensitivity (weeks)")
-    ax_75.set_ylabel("Crisis Response (Peak–Trough Return)")
-    ax_75.set_title("TSM Hedge Efficacy for 7.5% Threshold")
-    ax_75.set_xticks(trend_sens)
-    ax_75.grid(True, ls="--", lw=0.5)
-    ax_75.legend()
-    st.pyplot(fig_75)
-
-    # ----- 12.5% threshold tables -----
-    st.header("Public Equity and Synthetic Endowment — 12.5% Threshold")
-    thr = 0.125
-    crises_pe_125  = detect_crises(dd_pe,  thr)
-    crises_sei_125 = detect_crises(dd_sei, thr)
-    for name, crises in [("Public Equity", crises_pe_125),
-                         ("Synthetic Endowment", crises_sei_125)]:
-        df_125 = build_crisis_table(crises, cum_hedge)
-        st.dataframe(df_125, height=350)
-        st.code(to_latex(df_125, f"{name} Crises 12.5%", 12.5), language="latex")
-
-    # ----- 12.5% Threshold plot -----
-    st.header("12.5% Threshold Crisis Response")
-    pe_med_125, sei_med_125, pe_mean_125, sei_mean_125 = compute_tsm_medians(
-        cum_hedge,
-        {"PuE": crises_pe_125, "SEI": crises_sei_125},
-        trend_sens
-    )
-    
-    fig_125, ax_125 = plt.subplots(figsize=(7.5, 5))
-    ax_125.plot(trend_sens, pe_med_125,  marker="o", label="Public Equity (Median)", color="tab:blue")
-    ax_125.plot(trend_sens, sei_med_125, marker="o", label="Synthetic Endowment (Median)", color="tab:orange")
-    ax_125.plot(trend_sens, pe_mean_125, marker="x", linestyle="--", label="Public Equity (Mean)", color="tab:blue")
-    ax_125.plot(trend_sens, sei_mean_125, marker="x", linestyle="--", label="Synthetic Endowment (Mean)", color="tab:orange")
-    ax_125.set_xlabel("Trend Sensitivity (weeks)")
-    ax_125.set_ylabel("Crisis Response (Peak–Trough Return)")
-    ax_125.set_title("TSM Hedge Efficacy for 12.5% Threshold")
-    ax_125.set_xticks(trend_sens)
-    ax_125.grid(True, ls="--", lw=0.5)
-    ax_125.legend()
-    st.pyplot(fig_125)
-
-    # ----- Top 4 Largest Crises tables -----
-    st.header("Public Equity and Synthetic Endowment — Top 4 Largest Crises")
-    top_4_pe  = sorted(crises_pe, key=lambda x: abs(x['Max']))[-4:]
-    top_4_sei = sorted(crises_sei, key=lambda x: abs(x['Max']))[-4:]
-    for name, crises in [("Public Equity", top_4_pe),
-                         ("Synthetic Endowment", top_4_sei)]:
-        df_top4 = build_crisis_table(crises, cum_hedge)
-        st.dataframe(df_top4, height=350)
-        st.code(to_latex(df_top4, f"{name} Top 4 Largest Crises", 0.0), language="latex")
-
-    # ----- Top 4 Largest Crises plot -----
-    st.header("Top 4 Largest Crises Crisis Response")
-    pe_med_top4, sei_med_top4, pe_mean_top4, sei_mean_top4 = compute_tsm_medians(
-        cum_hedge,
-        {"PuE": top_4_pe, "SEI": top_4_sei},
-        trend_sens
-    )
-    
-    fig_top4, ax_top4 = plt.subplots(figsize=(7.5, 5))
-    ax_top4.plot(trend_sens, pe_med_top4,  marker="o", label="Public Equity (Median)", color="tab:blue")
-    ax_top4.plot(trend_sens, sei_med_top4, marker="o", label="Synthetic Endowment (Median)", color="tab:orange")
-    ax_top4.plot(trend_sens, pe_mean_top4, marker="x", linestyle="--", label="Public Equity (Mean)", color="tab:blue")
-    ax_top4.plot(trend_sens, sei_mean_top4, marker="x", linestyle="--", label="Synthetic Endowment (Mean)", color="tab:orange")
-    ax_top4.set_xlabel("Trend Sensitivity (weeks)")
-    ax_top4.set_ylabel("Crisis Response (Peak–Trough Return)")
-    ax_top4.set_title("TSM Hedge Efficacy for Top 4 Largest Crises")
-    ax_top4.set_xticks(trend_sens)
-    ax_top4.grid(True, ls="--", lw=0.5)
-    ax_top4.legend()
-    st.pyplot(fig_top4)
 
 if __name__ == "__main__":
     main()

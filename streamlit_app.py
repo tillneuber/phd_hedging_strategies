@@ -5,8 +5,6 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.ticker import PercentFormatter
 import math
-from pages.robustness import load_endowment_allocations_and_returns
-
 
 ########################################
 #  FIX: DEFINE load_historical_saa()
