@@ -5,6 +5,8 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.ticker import PercentFormatter
 import math
+from pages.robustness import load_endowment_allocations_and_returns
+
 
 ########################################
 #  FIX: DEFINE load_historical_saa()
@@ -24,7 +26,7 @@ def load_and_preprocess_data():
     Load CSVs, parse dates, convert % to decimals, return DataFrames:
       1) allocations (historical endowment SAA)
       2) quarterly returns for various asset classes
-    We add a 0.0% baseline row at 01-Jul-1999 for the quarterly data.
+    We add a 0.0% baseline row at 01‑Jul‑1999 for the quarterly data.
     """
 
     ########################################
@@ -36,7 +38,7 @@ def load_and_preprocess_data():
     ]
     allocations = pd.read_csv('data/hist_endowment_saa.csv', sep=';', names=alloc_cols, header=0)
 
-    # Convert wide->long
+    # Convert wide→long
     allocations = allocations.melt(
         id_vars=['Year'], var_name='Asset Class', value_name='Allocation'
     )
@@ -63,7 +65,7 @@ def load_and_preprocess_data():
         )
     )
 
-    # ---- Add a zero-return baseline row at 01-Jul-1999 ----
+    # ---- Add a zero‑return baseline row at 01‑Jul‑1999 ----
     base_dt = pd.Timestamp("1999-07-01")
     if base_dt not in returns_quarterly.index:
         zero_vals = {col: 0.0 for col in returns_quarterly.columns}
@@ -77,8 +79,8 @@ def load_individual_endowments():
     """
     Load CSV with columns like:
        Date;Yale;Stanford;Harvard;Average Endowment (NACUBO)
-    Convert % -> decimals, keep the date as end-of-period,
-    and add a 0.0% baseline row at 01-Jul-1999 for the annual data as well.
+    Convert % → decimals, keep the date as end‑of‑period,
+    and add a 0.0% baseline row at 01‑Jul‑1999 for the annual data as well.
     """
     df = pd.read_csv('data/individual_endowments.csv', sep=';', header=0)
     df['Date'] = pd.to_datetime(df['Date'], format='%d.%m.%Y', errors='coerce')
@@ -89,7 +91,7 @@ def load_individual_endowments():
     for col in df.columns:
         df[col] = df[col].apply(lambda x: float(str(x).replace('%', ''))/100 if pd.notnull(x) else np.nan)
 
-    # ---- Add a zero-return baseline row at 01-Jul-1999 ----
+    # ---- Add a zero‑return baseline row at 01‑Jul‑1999 ----
     base_dt = pd.Timestamp("1999-07-01")
     if base_dt not in df.index:
         zero_values = {col: 0.0 for col in df.columns}
@@ -124,7 +126,7 @@ def unify_timeframe(allocations, returns_q):
 
 def map_allocations_to_periods(allocations_df, date_index):
     """
-    For each date in date_index, find the 'Allocation' within (Start Date->End Date).
+    For each date in date_index, find the 'Allocation' within (Start Date→End Date).
     """
     allocations_mapped = pd.DataFrame(index=date_index)
     for asset in allocations_df['Asset Class'].unique():
@@ -146,123 +148,108 @@ def calculate_cumulative_and_dd(returns_series):
 
 
 ########################################
-#  MATPLOTLIB JOIF-STYLE PERFORMANCE CHART
+#  MATPLOTLIB JOIF‑STYLE PERFORMANCE CHART
 ########################################
 def create_performance_chart_jof_matplotlib(cum_dict, dd_dict, rep_crises=None):
     """
-    Two-subplot figure: top=cumulative, bottom=drawdowns,
-    grayscale style suitable for JoF.
-
-    Added: Crisis shading for any periods passed in rep_crises.
+    Two‑subplot figure: top=cumulative, bottom=drawdowns.
+    Crisis intervals (from the Synthetic Endowment) are shaded in light‑grey.
     """
 
-    fig, (ax1, ax2) = plt.subplots(nrows=2, ncols=1, sharex=True, figsize=(8,4.6))
+    fig, (ax1, ax2) = plt.subplots(nrows=2, ncols=1, sharex=True, figsize=(8, 4.6))
 
-    # -- 1) Optionally shade crisis intervals (from the Synthetic Endowment) --
+    # -- 1) Optionally shade crisis intervals -----------------------------
     if rep_crises:
         for crisis in rep_crises:
-            start = crisis['Start']
-            end = crisis['End']
-            ax1.axvspan(start, end, color='lightgray', alpha=0.3, zorder=0)
-            ax2.axvspan(start, end, color='lightgray', alpha=0.3, zorder=0)
+            start, end = crisis["Start"], crisis["End"]
+            ax1.axvspan(start, end, color="lightgray", alpha=0.3, zorder=0)
+            ax2.axvspan(start, end, color="lightgray", alpha=0.3, zorder=0)
 
-    # 2) Build a label_map to rename keys for final chart label
+    # -- 2) Helper to clean labels ----------------------------------------
     def rename_label(original_key):
         if original_key == "Synthetic Endowment Index":
             return "Synthetic Endowment Index"
-        cleaned = original_key.replace("(Q)", "").replace("(Annual)", "").strip()
-        return cleaned
+        return original_key.replace("(Q)", "").replace("(Annual)", "").strip()
 
-    # 3) Define the desired order. 
-    #    We move "Average Endowment (NACUBO)" before "Stanford" in the legend:
+    # -- 3) Desired legend / plotting order -------------------------------
     desired_order = [
         "Synthetic Endowment Index",
         "Public Equity",
         "Average Endowment (NACUBO)",
         "Yale",
         "Stanford",
-        "Harvard"
+        "Harvard",
     ]
 
-    # 4) Map each actual key to the final display label
-    rename_dict = {}
-    for k in cum_dict.keys():
-        rename_dict[k] = rename_label(k)
+    # -- 4) Map original keys to cleaned labels ---------------------------
+    rename_dict = {k: rename_label(k) for k in cum_dict.keys()}
 
-    # 5) Build a list of (final_label, actual_key) in the desired order, if present
+    # -- 5) Build (label, key) pairs in the desired order -----------------
     sorted_labels = []
-    for lbl in desired_order:
-        found_keys = [k for k, v in rename_dict.items() if v == lbl]
-        if found_keys:
-            sorted_labels.append((lbl, found_keys[0]))
+    for lab in desired_order:
+        keys = [k for k, v in rename_dict.items() if v == lab]
+        if keys:
+            sorted_labels.append((lab, keys[0]))
 
-    # 6) Define a line-style function (grayscale only)
+    # -- 6) Choose line style & COLOR (now coloured for endowments) -------
     def choose_line_style(label):
         if label == "Synthetic Endowment Index":
-            return dict(color='black', linestyle='solid', linewidth=1.3, zorder=2)
-        elif label == "Public Equity":
-            return dict(color='dimgray', linestyle='solid', linewidth=1.3, zorder=2)
-        elif label == "Average Endowment (NACUBO)":
-            return dict(color='gray', linestyle='dashdot', linewidth=1.2, zorder=2)
-        elif label in ["Stanford", "Yale", "Harvard"]:
-            return dict(color='silver', linestyle='dashed', linewidth=1.2, zorder=2)
-        return dict(color='black', linestyle='solid', linewidth=1.2, zorder=2)
+            return dict(color="black", linestyle="solid", linewidth=1.3, zorder=3)
+        if label == "Public Equity":
+            return dict(color="dimgray", linestyle="solid", linewidth=1.3, zorder=3)
+        if label == "Average Endowment (NACUBO)":
+            return dict(color="darkorange", linestyle="dashdot", linewidth=1.3, zorder=2)
+        if label == "Yale":
+            return dict(color="navy", linestyle="dashed", linewidth=1.2, zorder=2)
+        if label == "Stanford":
+            return dict(color="seagreen", linestyle="dashed", linewidth=1.2, zorder=2)
+        if label == "Harvard":
+            return dict(color="firebrick", linestyle="dashed", linewidth=1.2, zorder=2)
+        return dict(color="gray", linestyle="solid", linewidth=1.2, zorder=1)
 
-    # === PLOT: TOP SUBPLOT (CUMULATIVE) ===
-    for final_lbl, actual_key in sorted_labels:
-        series = cum_dict[actual_key]
-        if series.empty:
+    # ---------------- TOP: cumulative returns ---------------------------
+    for lbl, key in sorted_labels:
+        s = cum_dict[key]
+        if s.empty:
             continue
-        style_dict = choose_line_style(final_lbl)
-        ax1.plot(series.index, series.values, label=final_lbl, **style_dict)
+        ax1.plot(s.index, s.values, label=lbl, **choose_line_style(lbl))
 
     ax1.set_ylim(bottom=0.0)
     ax1.set_ylabel("Cumulative Returns", fontsize=8)
     ax1.tick_params(labelsize=8)
 
-    # === PLOT: BOTTOM SUBPLOT (DRAWDOWNS) ===
-    for final_lbl, actual_key in sorted_labels:
-        dd_series = dd_dict[actual_key]
-        if dd_series.empty:
+    # ---------------- BOTTOM: drawdowns ---------------------------------
+    for lbl, key in sorted_labels:
+        dd = dd_dict[key]
+        if dd.empty:
             continue
-        style_dict = choose_line_style(final_lbl)
-        ax2.plot(dd_series.index, dd_series.values, label=final_lbl, **style_dict)
+        ax2.plot(dd.index, dd.values, label=lbl, **choose_line_style(lbl))
 
     ax2.set_ylabel("Drawdowns", fontsize=8)
     ax2.tick_params(labelsize=8)
+    ax2.yaxis.set_major_formatter(PercentFormatter(1.0))
 
+    # -- 7) X‑axis formatting --------------------------------------------
     for ax in (ax1, ax2):
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
         ax.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=12))
         plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
 
-    ax2.yaxis.set_major_formatter(PercentFormatter(1.0))
-
-    # Deduplicate legend
-    handles1, labels1 = ax1.get_legend_handles_labels()
-    handles2, labels2 = ax2.get_legend_handles_labels()
-    all_handles = handles1 + handles2
-    all_labels = labels1 + labels2
-
-    unique = {}
-    for h, l in zip(all_handles, all_labels):
-        if l not in unique:
-            unique[l] = h
-
-    dedup_handles = list(unique.values())
-    dedup_labels = list(unique.keys())
-
+    # -- 8) Single shared legend (deduplicated) ---------------------------
+    handles, labels = ax1.get_legend_handles_labels()
     fig.legend(
-        dedup_handles, dedup_labels,
-        loc='lower center',
+        handles,
+        labels,
+        loc="lower center",
         bbox_to_anchor=(0.5, -0.1),
         ncol=3,
         frameon=False,
-        fontsize=8
+        fontsize=8,
     )
 
     fig.tight_layout(pad=1.2)
     return fig
+
 
 
 ########################################
@@ -297,17 +284,17 @@ def approximate_years_diff(ts_start, ts_end):
     return max(1, yrs_rounded)
 
 ########################################
-#  CRISIS DETECTION (≥ 5%) QUARTERLY
+#  CRISIS DETECTION (≥ 10 %) QUARTERLY
 ########################################
-def find_crisis_periods_for_rep_endowment(dd_series, threshold=0.05):
+def find_crisis_periods_for_rep_endowment(dd_series, threshold=0.10):
     """
     Identify crisis periods in the Representative (Synthetic) Endowment's quarterly drawdown
-    if ≥ threshold (5%).
+    if ≥ threshold (10 %).
 
     For each crisis:
       'Start'  = last date before the drawdown begins (peak)
       'Trough' = date of maximum drawdown
-      'End'    = date when the drawdown fully recovers to 0%
+      'End'    = date when the drawdown fully recovers to 0 %
     We skip crises where peak and trough coincide, or if the drawdown < threshold.
     """
     ds = dd_series.copy()
@@ -319,7 +306,7 @@ def find_crisis_periods_for_rep_endowment(dd_series, threshold=0.05):
         if not in_crisis and dd_val < 0:
             in_crisis = True
             idx = ds.index.get_loc(date)
-            # Set peak date as the previous date if dd was non-negative
+            # Set peak date as the previous date if dd was non‑negative
             if idx > 0 and ds.iloc[idx - 1] >= 0:
                 start_date = ds.index[idx - 1]
             else:
@@ -355,12 +342,12 @@ def find_crisis_periods_for_rep_endowment(dd_series, threshold=0.05):
 
 
 ########################################
-#    CRISIS DETECTION (≥ 5%) ANNUAL NACUBO
+#    CRISIS DETECTION (≥ 10 %) ANNUAL NACUBO
 ########################################
-def find_crisis_periods_for_nacubo_annual(returns_series, threshold=0.05):
+def find_crisis_periods_for_nacubo_annual(returns_series, threshold=0.10):
     """
     Identify crisis periods in the Average Endowment (NACUBO) annual data if
-    the peak-to-trough decline ≥ threshold (5%).
+    the peak‑to‑trough decline ≥ threshold (10 %).
     - Peak Date: The last date before the drawdown begins (local maximum).
     - Trough Date: The date when the maximum drawdown is reached.
     - Crises with identical peak and trough dates are skipped.
@@ -415,7 +402,7 @@ def find_crisis_periods_for_nacubo_annual(returns_series, threshold=0.05):
 
 
 ########################################
-#   Time-to-Recovery Helpers
+#   Time‑to‑Recovery Helpers
 ########################################
 def find_time_to_recovery_q(cum_series, start_d, trough_d):
     """
@@ -448,14 +435,14 @@ def find_time_to_recovery_annual(cum_s, s_d, t_d):
 
 
 ########################################
-#  TABLE BUILDING - QUARTERLY
+#  TABLE BUILDING – QUARTERLY
 #  UPDATED to incorporate Recovery Date,
-#  rename "Representative Endowment" -> "Synthetic Endowment Index",
+#  rename "Representative Endowment" → "Synthetic Endowment Index",
 #  remove "q" suffix, etc.
 ########################################
 def pivot_crises_into_columns(rep_crises, cum_dict):
     """
-    Builds a pivoted crisis table based on a >=5% drawdown in the
+    Builds a pivoted crisis table based on a ≥ 10 % drawdown in the
     Synthetic Endowment Index.
 
     Includes:
@@ -465,7 +452,7 @@ def pivot_crises_into_columns(rep_crises, cum_dict):
      • Max Drawdown
      • Drawdown Length (in quarters, but no 'q' suffix)
      • Time to Recovery (in quarters, no suffix)
-     • Public Equity Drawdown (Peak->Trough)
+     • Public Equity Drawdown (Peak→Trough)
      • Public Equity Time to Recovery
     """
     if not rep_crises:
@@ -495,13 +482,13 @@ def pivot_crises_into_columns(rep_crises, cum_dict):
         end_dt = crisis['End']
         max_dd = crisis['Max Drawdown']
 
-        # Row 0 => Beginning Date
+        # Row 0 → Beginning Date
         data[cname][0] = str(start_dt.date())
-        # Row 1 => Trough Date
+        # Row 1 → Trough Date
         data[cname][1] = str(trough_dt.date())
-        # Row 2 => Recovery Date
+        # Row 2 → Recovery Date
         data[cname][2] = str(end_dt.date())
-        # Row 3 => Max Drawdown
+        # Row 3 → Max Drawdown
         data[cname][3] = f"{max_dd:.1%}"
 
         # Drawdown length
@@ -516,10 +503,10 @@ def pivot_crises_into_columns(rep_crises, cum_dict):
         else:
             data[cname][5] = "n/a"
 
-        # Row 6 => (separator)
+        # Row 6 → (separator)
         data[cname][6] = "---"
 
-        # Rows 7..8 => Public Equity
+        # Rows 7..8 → Public Equity
         if "Public Equity" in cum_dict:
             pe_cum = cum_dict["Public Equity"]
             if (start_dt in pe_cum.index) and (trough_dt in pe_cum.index):
@@ -545,13 +532,13 @@ def pivot_crises_into_columns(rep_crises, cum_dict):
 
 
 ########################################
-#  TABLE BUILDING - ANNUAL NACUBO
+#  TABLE BUILDING – ANNUAL NACUBO
 ########################################
 def pivot_crises_into_columns_annual(nacubo_crises, annual_cum_dict):
     """
-    For annual NACUBO-based crises. Columns => Crisis1, Crisis2, ...
-    Show Public Equity, Rep Endowment, Yale,Stanford,Harvard.
-    Time to Recovery => integer # of years (rounded).
+    For annual NACUBO‑based crises. Columns → Crisis1, Crisis2, ...
+    Show Public Equity, Rep Endowment, Yale, Stanford, Harvard.
+    Time to Recovery → integer # of years (rounded).
     """
     if not nacubo_crises:
         return pd.DataFrame()
@@ -645,7 +632,7 @@ def export_table_to_latex_pivot(df, description=""):
     columns = df.columns.tolist()
     row_labels = df.index.tolist()
 
-    # We'll do first column => l, then all columns => c
+    # first column → l, then all columns → c
     align_str = "l" + "".join(["c"] * len(columns))
 
     lines = []
@@ -654,7 +641,7 @@ def export_table_to_latex_pivot(df, description=""):
     lines.append(r"\begin{tiny}")
     lines.append(
         rf"\caption{{\normalsize{{{description}}}\\" 
-        r"\footnotesize{Crisis identification based on a 5\% drawdown threshold.}}"
+        r"\footnotesize{Crisis identification based on a 10\% drawdown threshold.}}"
     )
     lines.append(r"\label{table:crisis_pivot}")
     lines.append(r"\begin{tabular*}{\linewidth}{@{\extracolsep{\fill}}" + align_str + r"}")
@@ -693,14 +680,14 @@ def export_table_to_latex_pivot(df, description=""):
 #                MAIN
 ########################################
 def main():
-    st.title("Approach #1: Two Separate Tables for Quarterly vs. Annual Crises")
+    st.title("Approach #1: Two Separate Tables for Quarterly vs. Annual Crises")
 
     # 1) Load Data
     allocations, ret_q_full = load_and_preprocess_data()
-    # Create a unified timeframe for allocations-based calculations.
+    # Create a unified timeframe for allocations‑based calculations.
     allocations, ret_q, q_start, q_end = unify_timeframe(allocations, ret_q_full.copy())
 
-    # NOTE: By default, let's pick a quarterly frequency that matches 'QE-DEC'
+    # NOTE: By default, pick a quarterly frequency that matches 'QE‑DEC'
     idx_q = pd.date_range(q_start, q_end, freq='QE-DEC')
 
     # Calculate Synthetic Endowment Index returns using the unified timeframe.
@@ -711,18 +698,17 @@ def main():
     rep_cum, rep_dd = calculate_cumulative_and_dd(hist_endw_returns)
 
     # Build the dictionary for the chart (quarterly).
-    # Renaming "Representative Endowment" -> "Synthetic Endowment Index":
     cum_dict_quarterly = {
         "Synthetic Endowment Index": rep_cum
     }
 
-    # For Public Equity, we can attach the full returns so it starts in 1999 as well
+    # For Public Equity, attach the full returns so it starts in 1999 as well
     if 'Public Equity' in ret_q_full.columns:
         pe_returns = ret_q_full['Public Equity'].dropna()
         pe_cum, pe_dd = calculate_cumulative_and_dd(pe_returns)
         cum_dict_quarterly["Public Equity"] = pe_cum
 
-    # Now add the annual endowments too (Yale,Stanford,Harvard,NACUBO)
+    # Add the annual endowments too (Yale, Stanford, Harvard, NACUBO)
     endow_df = load_individual_endowments()
     for col in endow_df.columns:
         s_ = endow_df[col].dropna().sort_index()
@@ -731,23 +717,23 @@ def main():
             cum_dict_quarterly[col] = c_
 
     # ====== FIRST TABLE: QUARTERLY CRISES FOR SYNTHETIC ENDOWMENT INDEX ======
-    rep_crises_q = find_crisis_periods_for_rep_endowment(rep_dd, threshold=0.05)
+    rep_crises_q = find_crisis_periods_for_rep_endowment(rep_dd, threshold=0.10)
     pivot_df_q = pivot_crises_into_columns(rep_crises_q, cum_dict_quarterly)
 
-    st.subheader("Table 1: Quarterly Crisis Periods (≥5% Drawdown for Synthetic Endowment Index)")
+    st.subheader("Table 1: Quarterly Crisis Periods (≥ 10 % Drawdown for Synthetic Endowment Index)")
     st.write(
-        "This table shows crises defined by a >=5% drawdown in the Synthetic Endowment Index (quarterly data). "
-        "We now include a Recovery Date row, remove 'q' suffixes, and rename all references to 'Synthetic Endowment Index'. "
+        "This table shows crises defined by a ≥ 10 % drawdown in the Synthetic Endowment Index (quarterly data). "
+        "We include a Recovery Date row, remove 'q' suffixes, and use the label 'Synthetic Endowment Index'. "
         "Public Equity is included to compare drawdowns and recovery times. "
-        "No individual endowments are shown here since they are annual data."
+        "No individual endowments are shown here because they are annual data."
     )
     st.dataframe(pivot_df_q)
 
     latex_table_q = export_table_to_latex_pivot(
         pivot_df_q,
-        description="Quarterly Crisis Periods (≥5% Drawdown for Synthetic Endowment Index)."
+        description="Quarterly Crisis Periods (≥ 10 % Drawdown for Synthetic Endowment Index)."
     )
-    st.subheader("Latex Code for the Quarterly Crisis Table")
+    st.subheader("LaTeX Code for the Quarterly Crisis Table")
     st.code(latex_table_q, language="latex")
 
     # ====== SECOND TABLE: ANNUAL CRISES FOR NACUBO ======
@@ -760,13 +746,13 @@ def main():
             nacubo_cum = (1 + nacubo_ret).cumprod()
             annual_cum_dict["Average Endowment (NACUBO)"] = nacubo_cum
 
-            # We'll compare NACUBO crises to Public Equity, Synthetic Endowment Index, Yale, Stanford, Harvard
+            # Compare NACUBO crises to Public Equity, Synthetic Endowment Index, Yale, Stanford, Harvard
             annual_dates = nacubo_ret.index
 
             def reindex_annual(cum_series, new_index):
                 if cum_series.empty:
                     return pd.Series(dtype=float)
-                # forward-fill to match annual points
+                # forward‑fill to match annual points
                 return cum_series.reindex(new_index, method='pad').dropna()
 
             # Synthetic Endowment Index
@@ -778,7 +764,7 @@ def main():
                 pe_annual = reindex_annual(cum_dict_quarterly["Public Equity"], annual_dates)
                 annual_cum_dict["Public Equity"] = pe_annual
 
-            # Yale,Stanford,Harvard
+            # Yale, Stanford, Harvard
             for e_col in ["Yale", "Stanford", "Harvard"]:
                 if e_col in cum_dict_quarterly:
                     e_cum_ = cum_dict_quarterly[e_col]
@@ -786,23 +772,23 @@ def main():
                     annual_cum_dict[e_col] = e_annual
 
             # Identify NACUBO crises
-            nacubo_crises = find_crisis_periods_for_nacubo_annual(nacubo_ret, threshold=0.05)
+            nacubo_crises = find_crisis_periods_for_nacubo_annual(nacubo_ret, threshold=0.10)
             pivot_df_annual = pivot_crises_into_columns_annual(nacubo_crises, annual_cum_dict)
 
-            st.subheader("Table 2: Annual Crisis Periods (≥5% Decline for NACUBO Average)")
+            st.subheader("Table 2: Annual Crisis Periods (≥ 10 % Decline for NACUBO Average)")
             st.write(
-                "We define crises based on the Average Endowment (NACUBO) having a >=5% annual drawdown. "
-                "We compare how the Synthetic Endowment Index and Public Equity (reindexed to annual), "
-                "as well as Yale, Stanford, and Harvard, performed in these periods. "
+                "Crises are defined by the Average Endowment (NACUBO) having a ≥ 10 % annual drawdown. "
+                "We compare how the Synthetic Endowment Index and Public Equity (re‑indexed to annual), "
+                "as well as Yale, Stanford and Harvard, performed in these periods. "
                 "Lengths and time to recovery are expressed in integer years (rounded)."
             )
             st.dataframe(pivot_df_annual)
 
             latex_table_annual = export_table_to_latex_pivot(
                 pivot_df_annual,
-                description="Annual Crisis Periods (≥5% Decline for NACUBO Average)."
+                description="Annual Crisis Periods (≥ 10 % Decline for NACUBO Average)."
             )
-            st.subheader("Latex Code for the Annual Crisis Table")
+            st.subheader("LaTeX Code for the Annual Crisis Table")
             st.code(latex_table_annual, language="latex")
 
     # Build dd_dict for the quarterly chart
@@ -815,7 +801,7 @@ def main():
             dd = (series_cum - run_max) / run_max
             dd_dict_q[lbl] = dd
 
-    st.subheader("Matplotlib Journal-Style Performance Chart (Quarterly Data)")
+    st.subheader("Matplotlib Journal‑Style Performance Chart (Quarterly Data)")
     # Pass the rep_crises_q so that we can shade those intervals
     fig_jof = create_performance_chart_jof_matplotlib(
         cum_dict_quarterly,

@@ -28,6 +28,69 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.ticker import PercentFormatter
 
+
+###############################################################################
+#                      HELPER: EXPORT TABLE TO LATEX
+###############################################################################
+def export_table_to_latex(df, description, threshold):
+    """
+    Convert a Pandas DataFrame (df) into a styled LaTeX table string.
+    Includes:
+    - \begin{table}, \centering, \begin{tiny}, ...
+    - A caption with the 'description' and a note about the threshold.
+    - A simple 'l' + 'c' * number_of_columns alignment approach.
+    - \toprule, \midrule, \bottomrule for better table style.
+    """
+
+    # Gather columns and index as lists
+    cols = df.columns.tolist()
+    index_labels = df.index.tolist()
+
+    # We'll do first column => l, then all columns => c
+    # So if the DF has N columns, alignment is "l" + "c"*N
+    align_str = "l" + "".join(["c" for _ in range(len(cols))])
+
+    lines = []
+    lines.append(r"\begin{table}[!ht]")
+    lines.append(r"\centering")
+    lines.append(r"\begin{tiny}")
+    lines.append(
+        rf"\caption{{\normalsize{{{description}}}\\"
+        rf"\footnotesize{{Crisis identification based on a {threshold:.0f}\% drawdown threshold.}}}}"
+    )
+    lines.append(r"\label{table:" + description.replace(" ", "_").lower() + "}")
+    lines.append(r"\begin{tabular*}{\linewidth}{@{\extracolsep{\fill}}" + align_str + r"}")
+    lines.append(r"\toprule")
+
+    # Header line
+    header_line = [""] + [str(c) for c in cols]
+    lines.append(" & ".join(header_line) + r" \\")
+    lines.append(r"\midrule")
+
+    # Table body
+    for idx_label in index_labels:
+        row_vals = df.loc[idx_label, :]
+
+        # If row_vals is a Series, we can iterate columns:
+        row_cells = [str(idx_label)]  # first column: the row index
+        for col in cols:
+            val = row_vals[col]
+            # Convert any percent sign to escaped
+            if isinstance(val, str):
+                val = val.replace("%", r"\%")
+            row_cells.append(str(val))
+
+        line = " & ".join(row_cells) + r" \\"
+        lines.append(line)
+
+    lines.append(r"\bottomrule")
+    lines.append(r"\end{tabular*}")
+    lines.append(r"\end{tiny}")
+    lines.append(r"\end{table}")
+
+    return "\n".join(lines)
+
+
 ###############################################################################
 #                         LOADING MAIN DATA
 ###############################################################################
@@ -181,7 +244,7 @@ def load_hedging_strategies():
 ###############################################################################
 def find_crisis_periods_for_rep_endowment(dd_series, threshold=0.05):
     """
-    Identify crisis periods in the drawdown if ≥ threshold (5%).
+    Identify crisis periods in the drawdown if ≥ threshold (default 5% here).
     This logic ensures:
       - A crisis begins when dd first goes below 0.
       - 'Start' = the last date dd >= 0 prior to that (or same date if not found).
@@ -216,7 +279,7 @@ def find_crisis_periods_for_rep_endowment(dd_series, threshold=0.05):
                 max_dd = dd_val
                 trough_date = date
 
-            # Crisis ends if dd_val returns to 0
+            # Crisis ends if dd_val == 0
             if dd_val == 0:
                 in_crisis = False
                 end_date = date
@@ -422,7 +485,7 @@ def main():
         "Select the crisis threshold (%)",
         min_value=1,
         max_value=25,
-        value=5,
+        value=10,  # <-- DEFAULT IS NOW 10%
         step=1
     )
     crisis_threshold = threshold_percentage / 100.0
@@ -497,6 +560,14 @@ def main():
     if pe_crises:
         df_pe_crisis = build_crisis_table_with_hedges(pe_crises, "Public Equity", cum_hedges)
         st.dataframe(df_pe_crisis)
+
+        # Generate and display LaTeX code for the Public Equity crisis table
+        latex_pe = export_table_to_latex(df_pe_crisis,
+                                         "Public Equity Crisis Table",
+                                         threshold_percentage)
+        st.markdown("**LaTeX Code for Public Equity Crisis Table**:")
+        st.code(latex_pe, language="latex")
+
     else:
         st.write("No Public Equity crises => no table.")
 
@@ -504,10 +575,19 @@ def main():
     if endw_crises:
         df_endw_crisis = build_crisis_table_with_hedges(endw_crises, "Synthetic Endowment", cum_hedges)
         st.dataframe(df_endw_crisis)
+
+        # Generate and display LaTeX code for the Endowment crisis table
+        latex_endw = export_table_to_latex(df_endw_crisis,
+                                           "Endowment Crisis Table",
+                                           threshold_percentage)
+        st.markdown("**LaTeX Code for Endowment Crisis Table**:")
+        st.code(latex_endw, language="latex")
+
     else:
         st.write("No Endowment crises => no table.")
 
-    st.markdown("""
+    st.markdown(
+        """
 **Interpretation**:
 - For each crisis, we show:
   - Start, Trough, End dates
@@ -516,7 +596,8 @@ def main():
   - Time to Recovery = quarters from Trough -> End
   - For each hedge strategy, "HEDGE: X" column shows that strategy's peak->trough performance.
 - The final rows **"ALL - AVERAGE"** and **"ALL - MEDIAN"** summarize hedge performance across all crises.
-""")
+"""
+    )
 
     # 6) Plot each portfolio + shading
     st.subheader("Cumulative + Drawdown Charts with Crisis Shading")
@@ -529,13 +610,16 @@ def main():
     fig_endw = plot_portfolio_with_crises(cum_endw, dd_endw, endw_crises, label="Synthetic Endowment")
     st.pyplot(fig_endw)
 
-    st.info("""
+    st.info(
+        """
 By using the same unified timeframe and the same crisis-detection logic for both 
 Public Equity and the Synthetic Endowment Index, the table and the chart should 
 now be consistent. 
 You can see how each portfolio's crises differ in timing and severity, and how 
 various hedge strategies performed from peak-to-trough of each crisis.
-""")
+"""
+    )
+
 
 if __name__ == "__main__":
     main()
