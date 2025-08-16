@@ -66,29 +66,45 @@ def load_endowment_returns_data(
     return df
 
 
-def load_hedge_strategies(
-    file_path: str = "data/hedging_strategies.csv"
-) -> pd.DataFrame:
+def load_hedge_strategies() -> pd.DataFrame:
     """
-    Load hedge strategy returns, parse dates to month-end, convert %-strings → decimal.
-    Missing data stays NaN (so coverage checks work downstream).
+    Load the hedging strategy CSV, convert percentages to decimals,
+    rename the five time-series-momentum sleeves, and create an equal-weight
+    TSM Basket column.
     """
-    df = pd.read_csv(file_path, sep=";", header=0)
+    file_path = "data/hedging_strategies.csv"
+    df = pd.read_csv(file_path, sep=";")
     df["Date"] = pd.to_datetime(df["Date"], format="%d.%m.%Y", errors="coerce")
     df.set_index("Date", inplace=True)
     df.index = df.index + pd.offsets.MonthEnd(0)
 
+    # convert % strings → decimal floats
     for col in df.columns:
         df[col] = (
             df[col]
             .astype(str)
-            .str.replace("%","", regex=False)
+            .str.rstrip("%")
             .replace("", np.nan)
             .astype(float)
-            / 100.0
+            .div(100)
         )
 
     df.sort_index(inplace=True)
+
+    # friendly column names
+    rename_map = {
+        "V Fast":  "Time Series Momentum (Very Fast)",
+        "Fast":    "Time Series Momentum (Fast)",
+        "Med":     "Time Series Momentum (Med)",
+        "Slow":    "Time Series Momentum (Slow)",
+        "V Slow":  "Time Series Momentum (Very Slow)",
+    }
+    df.rename(columns=rename_map, inplace=True)
+
+    # add the equal-weight basket across the five sleeves
+    tsm_cols = list(rename_map.values())
+    df["Time Series Momentum (Basket)"] = df[tsm_cols].mean(axis=1)
+
     return df
 
 

@@ -25,14 +25,14 @@ def load_hedging_strategies():
     """
     Load CSV "data/hedging_strategies.csv" with columns like:
     Date;Global Macro;Hedge Funds;Tail Risk Hedge Funds;V Fast;Fast;Med;Slow;V Slow
-    Convert to decimals, set Date as index (month‑end).
+    Convert to decimals, set Date as index (month-end).
     After loading, rename:
       'V Fast' -> 'Time Series Momentum (Very Fast)'
       'Fast'   -> 'Time Series Momentum (Fast)'
       'Med'    -> 'Time Series Momentum (Med)'
       'Slow'   -> 'Time Series Momentum (Slow)'
       'V Slow' -> 'Time Series Momentum (Very Slow)'
-    Then resample to quarterly in the main app, so everything is on a quarterly frequency.
+    Then add TSM Basket as the equal-weighted average of the five TSM sleeves.
     """
     file_path = "data/hedging_strategies.csv"
     df = pd.read_csv(file_path, sep=';', header=0)
@@ -58,6 +58,10 @@ def load_hedging_strategies():
         'V Slow': 'Time Series Momentum (Very Slow)'
     }
     df.rename(columns=rename_map, inplace=True)
+
+    # Add TSM Basket (equal-weighted average)
+    tsm_cols = list(rename_map.values())
+    df['Time Series Momentum (Basket)'] = df[tsm_cols].mean(axis=1)
 
     return df
 
@@ -117,6 +121,92 @@ def find_crisis_periods_for_rep_endowment(dd_series, threshold=0.10):
                 'Max Drawdown': max_dd
             })
     return crises
+
+def create_crisis_return_panel(cum_dict, crises, hedge_keys):
+    """
+    Creates a third panel showing cumulative performance of hedging strategies
+    during each crisis period, starting at 0% for each crisis.
+    """
+    fig, ax = plt.subplots(figsize=(8, 2.8))
+
+    for key in hedge_keys:
+        series = cum_dict.get(key, None)
+        if series is None or series.empty:
+            continue
+
+        for crisis in crises:
+            s_dt, e_dt = crisis["Start"], crisis["End"]
+            if s_dt not in series.index or e_dt not in series.index:
+                continue
+
+            sub = series.loc[s_dt:e_dt].dropna()
+            if sub.empty:
+                continue
+
+            base = sub.iloc[0]
+            rel = sub / base - 1.0
+            ax.plot(rel.index, rel.values, label=key)
+
+    ax.set_ylabel("Crisis Return", fontsize=8)
+    ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+    ax.tick_params(labelsize=8)
+    ax.set_ylim(auto=True)
+
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=12))
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
+
+    ax.set_title("Hedging Strategy Performance During Crisis Periods", fontsize=10)
+    ax.grid(True, linestyle='--', linewidth=0.4, alpha=0.6)
+
+    if len(hedge_keys) <= 7:
+        ax.legend(loc='best', fontsize=7)
+
+    fig.tight_layout()
+    return fig
+
+###############################################################################
+#  (NEW)  BUILD PER-CRISIS “RESET” SERIES  FOR THE 3-PANEL CHART
+###############################################################################
+def _build_crisis_return_series(cum_series, crises):
+    """
+    For one strategy’s cumulative-NAV series, return a copy whose value
+    *resets to 0* at each crisis Start and then tracks the cumulative %
+    return until the crisis End.  Outside crisis windows the series is NaN,
+    so the bottom panel appears blank (= white).
+    """
+    if cum_series.empty or not crises:
+        return pd.Series(dtype=float)
+
+    # Start with an all-NaN series, same index as cum_series
+    out = pd.Series(np.nan, index=cum_series.index)
+
+    for c in crises:
+        s, e = c["Start"], c["End"]
+        if s not in cum_series.index or e not in cum_series.index:
+            continue  # skip if dates missing
+
+        # Sub-series for the crisis window
+        sub = cum_series.loc[s:e]
+        base = sub.iloc[0]
+        if np.isclose(base, 0):
+            continue
+        # Normalise: (cum / base) – 1  → starts at 0 %
+        out.loc[s:e] = sub / base - 1.0
+
+    return out
+
+
+def build_crisis_return_dict(cum_dict, crises, hedge_keys):
+    """
+    Create {strategy: crisis-return-series}.  Only hedging strategies
+    (hedge_keys) are included; SEI / PuE are *not* part of this dict.
+    """
+    crisis_dict = {}
+    for k in hedge_keys:
+        crisis_dict[k] = _build_crisis_return_series(cum_dict[k], crises)
+    return crisis_dict
+
 
 ###############################################################################
 #     PIVOT TABLE (REVISED): SHOW HEDGING STRATEGIES' PEAK‑>TROUGH PERF
@@ -511,7 +601,7 @@ def _linestyle_for(label: str):
 
 def create_split_chart(cum_dict, dd_dict, hedge_keys, crises=None, title=""):
     """
-    Two‑row Matplotlib figure (cumulative & drawdown) for a subset of hedging
+    Two-row Matplotlib figure (cumulative & drawdown) for a subset of hedging
     strategies (hedge_keys). Synthetic Endowment Index and Public Equity are
     always included and plotted dashed; hedge strategies are plotted solid.
     """
@@ -545,7 +635,7 @@ def create_split_chart(cum_dict, dd_dict, hedge_keys, crises=None, title=""):
             ax1.axvspan(crisis['Start'], crisis['End'], color='lightgray', alpha=0.3, zorder=0)
             ax2.axvspan(crisis['Start'], crisis['End'], color='lightgray', alpha=0.3, zorder=0)
 
-    # X‑axis formatting
+    # X-axis formatting
     for ax in (ax1, ax2):
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
         ax.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=12))
@@ -567,6 +657,92 @@ def create_split_chart(cum_dict, dd_dict, hedge_keys, crises=None, title=""):
     if title:
         fig.suptitle(title, y=1.02, fontsize=10)
     return fig
+
+###############################################################################
+#                          3-PANEL CHART CREATOR  (revised)
+###############################################################################
+def create_three_panel_chart(
+    cum_dict,
+    dd_dict,
+    crisis_ret_dict,
+    crises=None,
+    crisis_ylim=(-0.10, 0.40)      # fixed y-scale for bottom panel
+):
+    """
+    Three stacked panels:
+      (1) cumulative returns
+      (2) drawdowns (SEI & Public Equity only)
+      (3) cumulative crisis-period returns
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import PercentFormatter
+    import matplotlib.dates as mdates
+
+    # ----- helper for consistent line style -----
+    def _ls(label):
+        if label == "Synthetic Endowment Index":
+            return dict(linestyle="--", linewidth=1.2, color="black")
+        if label == "Public Equity":
+            return dict(linestyle="--", linewidth=1.2, color="dimgray")
+        return dict(linestyle="-",  linewidth=1.2)
+
+    # slightly shorter figure + reduced h-space
+    fig, (ax1, ax2, ax3) = plt.subplots(
+        3, 1, sharex=True, figsize=(8, 5),
+        gridspec_kw={'hspace': 0.06}
+    )
+
+    # ---------------- (1) cumulative ----------------
+    for lbl, ser in cum_dict.items():
+        if ser.empty: continue
+        ax1.plot(ser.index, ser.values, label=lbl, **_ls(lbl))
+    ax1.set_ylabel("Cumulative\nReturn", fontsize=8)
+    ax1.tick_params(labelsize=8)
+
+    # ---------------- (2) drawdown ------------------
+    for lbl in ("Synthetic Endowment Index", "Public Equity"):
+        if lbl in dd_dict and not dd_dict[lbl].empty:
+            ax2.plot(dd_dict[lbl].index, dd_dict[lbl].values, **_ls(lbl))
+    ax2.set_ylabel("Drawdown", fontsize=8)
+    ax2.yaxis.set_major_formatter(PercentFormatter(1.0))
+    ax2.tick_params(labelsize=8)
+
+    # ---------------- (3) crisis returns ------------
+    for lbl, ser in crisis_ret_dict.items():
+        if ser.empty: continue
+        ax3.plot(ser.index, ser.values, label=lbl, **_ls(lbl))
+    ax3.set_ylabel("Crisis\nReturn", fontsize=8)
+    ax3.yaxis.set_major_formatter(PercentFormatter(1.0))
+    ax3.set_ylim(*crisis_ylim)
+    ax3.tick_params(labelsize=8)
+
+    # --------- crisis shading for all panels --------
+    if crises:
+        for c in crises:
+            for ax in (ax1, ax2, ax3):
+                ax.axvspan(c['Start'], c['End'],
+                           color='lightgray', alpha=0.3, zorder=0)
+
+    # --------------- x-axis formatting --------------
+    for ax in (ax1, ax2, ax3):
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=12))
+        plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
+
+    # ---------------- overall legend ----------------
+    handles, labels = ax1.get_legend_handles_labels()
+    fig.legend(
+        handles, labels, loc='lower center',
+        bbox_to_anchor=(0.5, -0.06), ncol=3,
+        frameon=False, fontsize=8
+    )
+
+    # tight layout with smaller padding
+    fig.tight_layout(pad=0.6)
+    plt.subplots_adjust(bottom=0.18)   # leaves room for legend
+
+    return fig
+
 
 ###############################################################################
 #                              MAIN APP
@@ -710,6 +886,58 @@ def main():
         "quarters it took for the Synthetic Endowment (or Public Equity) to regain its peak "
         f"levels after the trough.\n\n**Date Range**: {date_range_info}"
     )
+
+    ###############################################################################
+    # 9)  THREE-PANEL CHARTS:  TSM   vs.   Other Hedging Strategies
+    ###############################################################################
+
+    tsm_keys   = [k for k in cum_dict if "Time Series Momentum" in k]
+    other_keys = [k for k in cum_dict
+                if k not in tsm_keys and k not in ("Synthetic Endowment Index",
+                                                    "Public Equity")]
+
+    # ========== (A) TSM-only chart ==============================================
+    # --- keep only SEI, PuE, and TSM sleeves ------------------------------------
+    cum_tsm = {k: v for k, v in cum_dict.items()
+            if k in ("Synthetic Endowment Index", "Public Equity") or k in tsm_keys}
+    dd_tsm  = {k: v for k, v in dd_dict.items() if k in cum_tsm}
+
+    crisis_ret_tsm = build_crisis_return_dict(cum_tsm, crises, hedge_keys=tsm_keys)
+
+    st.subheader("3-Panel Chart – Time-Series Momentum Strategies")
+    if tsm_keys:
+        fig_3p_tsm = create_three_panel_chart(
+            cum_tsm,
+            dd_tsm,
+            crisis_ret_tsm,
+            crises=crises
+        )
+        st.pyplot(fig_3p_tsm)
+    else:
+        st.info("No Time-Series Momentum strategies available.")
+
+    # ========== (B) Other-hedges chart ==========================================
+    # --- keep only SEI, PuE, and non-TSM hedges ---------------------------------
+    cum_other = {k: v for k, v in cum_dict.items()
+                if k in ("Synthetic Endowment Index", "Public Equity") or k in other_keys}
+    dd_other  = {k: v for k, v in dd_dict.items() if k in cum_other}
+
+    crisis_ret_other = build_crisis_return_dict(cum_other, crises,
+                                                hedge_keys=other_keys)
+
+    st.subheader("3-Panel Chart – Other Hedging Strategies")
+    if other_keys:
+        fig_3p_other = create_three_panel_chart(
+            cum_other,
+            dd_other,
+            crisis_ret_other,
+            crises=crises
+        )
+        st.pyplot(fig_3p_other)
+    else:
+        st.info("No other hedging strategies available.")
+
+
 
 if __name__ == "__main__":
     main()

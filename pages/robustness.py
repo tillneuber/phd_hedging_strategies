@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import PercentFormatter
 from matplotlib import rcParams
 from decimal import Decimal, ROUND_HALF_UP
+from matplotlib.ticker import PercentFormatter
 
 from utils import (
     load_asset_allocation_and_returns_data,
@@ -31,11 +32,32 @@ with st.sidebar:
 
 
 rcParams.update({
-    "font.family": "serif",
     "font.size": 9,
     "axes.linewidth": 0.8,
 })
 
+# ───────────────────────────────────────────────────────── helpers ──
+def annualised_from_growth(growth: float, days: int) -> float:
+    """Annualise a total growth factor observed over *days* calendar days."""
+    if days <= 0 or pd.isna(growth) or growth <= 0:
+        return np.nan
+    years = days / 365.25
+    return growth ** (1 / years) - 1
+
+
+def combined_crisis_cagr(cum_ser: pd.Series, crises: list[dict]) -> float:
+    """
+    Compound the growth factors across ALL crisis windows, then annualise
+    over the total number of crisis days.  Non-crisis periods are ignored.
+    """
+    growth = 1.0
+    total_days = 0
+    for c in crises:
+        s, e = c["Start"], c["End"]
+        if s in cum_ser.index and e in cum_ser.index:
+            growth *= cum_ser.loc[e] / cum_ser.loc[s]
+            total_days += (e - s).days
+    return annualised_from_growth(growth, total_days) if total_days else np.nan
 
 
 def pct_1dig(x: float | None) -> str:
@@ -147,51 +169,109 @@ def to_latex(df, title, threshold):
     return "\n".join(lines)
 
 
-def generate_crisis_table(name, crises, cum_hedge, threshold):
-    st.subheader(f"{name} — {int(threshold*100)}% Threshold")
+def generate_crisis_table(name: str,
+                          crises: list[dict],
+                          cum_hedge: dict[str, pd.Series],
+                          threshold: float) -> None:
+    """Display crisis table with % numbers rounded to one decimal."""
+
     df = build_crisis_table(crises, cum_hedge)
-    st.dataframe(df, height=300)
-    st.code(to_latex(df, f"{name} Crises {int(threshold*100)}%", threshold), language="latex")
+    if df.empty:
+        st.info(f"No crises for {name}.");  return
+
+    hedge_cols = list(cum_hedge.keys())
+
+    # build a format‑mapping:  one‑decimal % for every hedge column
+    fmt_map = {c: (lambda x, _=c: pct_1dig(x)) for c in hedge_cols}
+
+    # Depth/Recov = integers, leave as default; Max DD already a string
+    st.subheader(f"{name} — {int(threshold*100)}% Threshold")
+    st.dataframe(df.style.format(fmt_map), height=300)
+
+    st.code(to_latex(df, f"{name} Crises {int(threshold*100)}%", threshold),
+            language="latex")
 
 
+# ───────────────────────────────────────────────────────── generate_crisis_plot ──
 def generate_crisis_plot(crises, cum_hedge, trend_sens, threshold):
+    """
+    Plot median, mean, and combined-crisis CAGR for PuE & SEI
+    across the five TSM signal speeds.  Key names in cum_hedge use the
+    full descriptive labels, so we map the numerical look-back lengths
+    to those column names here.
+    """
     st.write(f"### {int(threshold*100)}% Threshold")
 
-    # map speeds to hedge‐column names
-    speed2col = {4: "V Fast", 7: "Fast", 12: "Med", 20: "Slow", 24: "V Slow"}
+    # full column names in the hedging DataFrame
+    speed2col = {
+        4:  "Time Series Momentum (Very Fast)",
+        7:  "Time Series Momentum (Fast)",
+        12: "Time Series Momentum (Med)",
+        20: "Time Series Momentum (Slow)",
+        24: "Time Series Momentum (Very Slow)",
+    }
 
-    # build median+mean lists
-    def stats_for(cr):
-        med, mn = [], []
-        for sp in trend_sens:
-            col = speed2col[sp]
-            vals = [peak_to_trough(cum_hedge[col], c["Start"], c["Trough"]) for c in cr]
-            vals = [v for v in vals if pd.notna(v)]
-            med.append(np.nanmedian(vals) if vals else np.nan)
-            mn.append(np.nanmean(vals)   if vals else np.nan)
-        return med, mn
+    # ---------- helpers --------------------------------------------------
+    def pt_stats(ser, cr_list):
+        vals = [ser.loc[c["Trough"]] / ser.loc[c["Start"]] - 1
+                for c in cr_list
+                if c["Start"] in ser.index and c["Trough"] in ser.index]
+        return (np.nanmedian(vals) if vals else np.nan,
+                np.nanmean(vals)   if vals else np.nan)
 
-    pe_med, pe_mean = stats_for(crises["Public Equity"])
-    sei_med, sei_mean = stats_for(crises["Synthetic Endowment"])
+    def ann_combined(ser, cr_list):
+        return combined_crisis_cagr(ser, cr_list)
 
-    fig, ax = plt.subplots(figsize=(5,3.5))
-    colors = {"Public Equity":"black", "Synthetic Endowment":"dimgray"}
+    # ---------- build series --------------------------------------------
+    pe_med, pe_mean, pe_ann = ([] for _ in range(3))
+    sei_med, sei_mean, sei_ann = ([] for _ in range(3))
 
-    ax.plot(trend_sens, pe_med,   "o-", label="PuE Median",  color=colors["Public Equity"])
-    ax.plot(trend_sens, pe_mean,  "s--",label="PuE Mean",    color=colors["Public Equity"])
-    ax.plot(trend_sens, sei_med,  "o-", label="SEI Median",  color=colors["Synthetic Endowment"])
-    ax.plot(trend_sens, sei_mean, "s--",label="SEI Mean",    color=colors["Synthetic Endowment"])
+    for sp in trend_sens:
+        col = speed2col.get(sp)
+        if col is None or col not in cum_hedge:
+            # skip if the specified sleeve is missing
+            continue
 
+        ser = cum_hedge[col]
+
+        m_pu, a_pu  = pt_stats(ser, crises["Public Equity"])
+        m_se, a_se  = pt_stats(ser, crises["Synthetic Endowment"])
+
+        pe_med.append(m_pu);  pe_mean.append(a_pu)
+        sei_med.append(m_se); sei_mean.append(a_se)
+
+        pe_ann.append(ann_combined(ser, crises["Public Equity"]))
+        sei_ann.append(ann_combined(ser, crises["Synthetic Endowment"]))
+
+    # ---------- plotting -------------------------------------------------
+    fig, ax = plt.subplots(figsize=(6.2, 4.0))
+    colours = {"PuE": "black", "SEI": "#6e6e6e"}   # brighter gray for SEI
+
+    x_vals = [sp for sp in trend_sens if speed2col.get(sp) in cum_hedge]
+
+    # PuE lines
+    l1, = ax.plot(x_vals, pe_med,  "o-", label="PuE Median P-T", color=colours["PuE"])
+    l2, = ax.plot(x_vals, pe_mean, "s--", label="PuE Mean P-T",  color=colours["PuE"])
+    l3, = ax.plot(x_vals, pe_ann,  "^:", label="PuE Crisis CAGR",color=colours["PuE"])
+
+    # SEI lines
+    l4, = ax.plot(x_vals, sei_med,  "o-", label="SEI Median P-T", color=colours["SEI"])
+    l5, = ax.plot(x_vals, sei_mean, "s--", label="SEI Mean P-T",  color=colours["SEI"])
+    l6, = ax.plot(x_vals, sei_ann,  "v:", label="SEI Crisis CAGR",color=colours["SEI"])
+
+    ymax = np.nanmax(pe_med + pe_mean + pe_ann + sei_med + sei_mean + sei_ann)
+    ax.set_ylim(0, ymax * 1.05)
+    ax.yaxis.set_major_formatter(PercentFormatter(1.0, decimals=0))
     ax.set_xlabel("Trend Sensitivity (weeks)")
-    ax.set_ylabel("Peak–Trough Return")
-    ax.set_xticks(trend_sens)
-    ax.set_xlim(min(trend_sens)-1, max(trend_sens)+1)
-    ax.yaxis.set_major_formatter(PercentFormatter(1.0))
+    ax.set_ylabel("Return")
+    ax.set_xticks(x_vals)
     ax.grid(axis="y", linestyle="--", lw=0.5, alpha=0.7)
-    for sp in ["top","right"]:
-        ax.spines[sp].set_visible(False)
+    ax.spines[['top', 'right']].set_visible(False)
 
-    ax.legend(ncol=2, frameon=False, fontsize=8, loc="upper center", bbox_to_anchor=(0.5,1.12))
+    ax.legend([l1, l2, l3, l4, l5, l6],
+              [ln.get_label() for ln in (l1, l2, l3, l4, l5, l6)],
+              ncol=3, frameon=False, fontsize=8,
+              loc="upper center", bbox_to_anchor=(0.5, 1.18))
     fig.tight_layout(pad=0.5)
     st.pyplot(fig)
 
@@ -245,13 +325,13 @@ def tsm_speed_table(idx_q: pd.DatetimeIndex,
                     hedge_monthly: pd.DataFrame,
                     threshold: float = 0.10) -> None:
 
-    # 1 ─ crisis windows on PuE and SEI
+    # 1 ─ detect crises
     _, dd_pu  = calculate_cumulative_returns_and_drawdowns(pu_ret)
     _, dd_sei = calculate_cumulative_returns_and_drawdowns(sei_ret)
     pu_cr  = detect_crisis_periods(dd_pu,  threshold)
     sei_cr = detect_crisis_periods(dd_sei, threshold)
 
-    # 2 ─ cumulative TSM indices on quarter‑ends
+    # 2 ─ cumulative TSM indices on quarter-ends
     tags = {"V Fast", "Fast", "Med", "Slow", "V Slow"}
     cum_q = {}
     for col in hedge_monthly:
@@ -262,55 +342,43 @@ def tsm_speed_table(idx_q: pd.DatetimeIndex,
     if not cum_q:
         st.warning("No TSM data found.");  return
 
-    # 3 ─ keep crises fully covered by all overlays
+    # 3 ─ keep only crises fully covered by every overlay
     def covered(cr):
-        s, t = cr["Start"], cr["Trough"]
-        return all((s in srs.index and t in srs.index
-                    and not (pd.isna(srs.loc[s]) or pd.isna(srs.loc[t])))
-                   for srs in cum_q.values())
+        s, e = cr["Start"], cr["End"]
+        return all(s in srs.index and e in srs.index for srs in cum_q.values())
 
     pu_cr  = [c for c in pu_cr  if covered(c)]
     sei_cr = [c for c in sei_cr if covered(c)]
 
-    pt = lambda ser, cr: ser.loc[cr["Trough"]] / ser.loc[cr["Start"]] - 1
-
     rows = []
-    for name in cum_q:
-        cum_qtr = cum_q[name].dropna()
+    for name, cum_qtr in cum_q.items():
+        cum_qtr = cum_qtr.dropna()
         if cum_qtr.empty:
             continue
 
-        # crisis pay‑offs
+        # ---------- peak-to-trough pay-offs --------------------------
+        pt = lambda ser, cr: ser.loc[cr["Trough"]] / ser.loc[cr["Start"]] - 1
         pu_vals  = [pt(cum_qtr, c) for c in pu_cr]
         sei_vals = [pt(cum_qtr, c) for c in sei_cr]
 
         med_pu,  med_sei  = map(np.nanmedian, (pu_vals, sei_vals))
         mean_pu, mean_sei = map(np.nanmean,  (pu_vals, sei_vals))
 
-        # ── ORIGINAL carry: CAGR of MONTHLY returns from hedge_monthly
-        ret_m  = hedge_monthly[name].dropna()
-        years  = len(ret_m) / 12
-        carry  = (1 + ret_m).prod()**(1 / years) - 1
-        # -------------------------------------------------------------------
+        # ---------- combined crisis CAGR (new) -----------------------
+        ann_pu  = combined_crisis_cagr(cum_qtr, pu_cr)
+        ann_sei = combined_crisis_cagr(cum_qtr, sei_cr)
 
-        pcr_pu  = protection_cost_ratio(med_pu,  carry)
-        pcr_sei = protection_cost_ratio(med_sei, carry)
+        # ---------- long-run carry ----------------------------------
+        ret_m = hedge_monthly[name].dropna()
+        carry = (1 + ret_m).prod() ** (1 / (len(ret_m) / 12)) - 1 if len(ret_m) else np.nan
 
         rows.append({
-            "Strategy": name,
-            "Speed": ("Fast" if "fast" in name.lower()
-                      else "Slow" if any(x in name.lower() for x in ("slow", "med"))
-                      else "Other"),
-            "Median PuE":  med_pu,
-            "Median SEI":  med_sei,
-            "Mean PuE":    mean_pu,
-            "Mean SEI":    mean_sei,
-            "Rel Median":  None if med_pu  == 0 else med_sei  / med_pu  - 1,
-            "Rel Mean":    None if mean_pu == 0 else mean_sei / mean_pu - 1,
-            "PCR PuE":     pcr_pu,
-            "PCR SEI":     pcr_sei,
-            "Rel PCR":     None if pcr_pu  == 0 else pcr_sei  / pcr_pu  - 1,
-            "Annualised Carry %": carry * 100,
+            "Strategy":  name,
+            "Median PuE":  med_pu,   "Median SEI":  med_sei,
+            "Mean PuE":    mean_pu,  "Mean SEI":    mean_sei,
+            "Crisis CAGR PuE %":  ann_pu  * 100,
+            "Crisis CAGR SEI %":  ann_sei * 100,
+            "Annualised Carry %": carry   * 100,
         })
 
     if not rows:
@@ -319,16 +387,14 @@ def tsm_speed_table(idx_q: pd.DatetimeIndex,
     df = pd.DataFrame(rows).set_index("Strategy")
 
     pct1 = lambda x: "NA" if pd.isna(x) else f"{x*100:.1f}%"
-    two  = "{:.2f}".format
-    fmt  = {"Median PuE": pct1, "Median SEI": pct1,
-            "Mean PuE":   pct1, "Mean SEI":   pct1,
-            "Rel Median": pct1, "Rel Mean":   pct1,
-            "PCR PuE":    two,  "PCR SEI":    two,  "Rel PCR": two,
-            "Annualised Carry %": "{:.2f}"}
+    one  = "{:.1f}".format
+    fmt  = {"Median PuE": pct1, "Median SEI": pct1,
+            "Mean PuE":   pct1, "Mean SEI":   pct1,
+            "Crisis CAGR PuE %": one, "Crisis CAGR SEI %": one,
+            "Annualised Carry %": one}
 
-    st.subheader("Fast vs Slow TSM (10 % drawdown, relative improvements)")
-    st.dataframe(df.style.format(fmt), height=420)
-
+    st.subheader("Fast vs Slow TSM (10 % drawdown)")
+    st.dataframe(df.style.format(fmt), height=460)
 
 
 def main():
@@ -352,7 +418,7 @@ def main():
 
     trend_sens = trend_sensitivity()
 
-    for thr in [0.10, 0.075, 0.125]:
+    for thr in [0.10, 0.05, 0.15]:      # 10 %, 5 %, 15 %
         st.header(f"{int(thr*100)}% Threshold")
         process_threshold(thr, cum_pe, dd_pe, cum_sei, dd_sei, cum_hedge, trend_sens)
 
